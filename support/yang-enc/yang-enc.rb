@@ -935,7 +935,7 @@ end
 
 def decode_decimal64(value)
     exponent, mantissa = value.value
-    mantissa.to_s[...exponent].rjust(1, '0') + '.' + (mantissa.to_s[exponent...] or '0')
+    (mantissa * (10 ** exponent)).to_f.to_s
 end
 
 # Convert IID to a JSON string. See RFC 7951 section 6.11
