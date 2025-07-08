@@ -219,12 +219,13 @@ RSpec.describe 'type2json' do
         expect(type2json(type, 'eth1')).to eq 'eth1'
     end
 
-    it 'converts a decimal64 value in scientific notation with an exponent of -n to its decimal expansion with n fraction digits' do
+    it 'converts a decimal64 value i * 10^-n represented as [-n, i] to canonical form (see RFC 7951 section 9.3.2)' do
         type = Yang::Type.new 'decimal64'
         type.set_fraction_digits 2
         expect(type2json(type, CBOR::Tagged.new(4, [-2, 257]))).to eq '2.57'
-        expect(type2json(type, CBOR::Tagged.new(4, [-2, 2570]))).to eq '25.70'
-        expect(type2json(type, CBOR::Tagged.new(4, [-2, 25700]))).to eq '257.00'
+        expect(type2json(type, CBOR::Tagged.new(4, [-2, 2570]))).to eq '25.7'
+        expect(type2json(type, CBOR::Tagged.new(4, [-2, 25700]))).to eq '257.0'
+        expect(type2json(type, CBOR::Tagged.new(4, [-2, 0]))).to eq '0.0'
     end
 
     it 'converts a enumeration value to an enum name' do
@@ -316,5 +317,28 @@ RSpec.describe 'json_seq2cbor and cbor_seq2json' do
         yaml_canonical = cbor_seq2json(yang_schema, CBOR.decode_seq(cbor), 'ipatch')
         expect(json_seq2cbor(yang_schema, yaml_canonical, 'ipatch')).to eq cbor
         expect(json_seq2cbor(yang_schema, yaml, 'ipatch')).to eq cbor
+    end
+end
+
+RSpec.describe 'iid2cbor' do
+    include_context 'yang catalog'
+
+    it "converts keys to CBOR in the order specified by the YANG not the instance identifier" do
+        iid, s = iid2cbor(yang_schema, "/ietf-routing:routing/control-plane-protocols/control-plane-protocol[name='børge'][type='routing-protocol']")
+        expect(iid.size).to eq 3
+        expect(iid[1]).to eq 12006
+        expect(iid[2]).to eq 'børge'
+    end
+
+    it "raises an error if keys are specified on a non-list element" do
+      expect { iid2cbor(yang_schema, "/ietf-routing:routing/control-plane-protocols[name='børge'][type='routing-protocol']/control-plane-protocol") }.to raise_error(RuntimeError)
+    end
+
+    it "raises an error if non-existing keys are specified on a list element" do
+      expect { iid2cbor(yang_schema, "/ietf-routing:routing/control-plane-protocols/control-plane-protocol[type='routing-protocol'][kage=0]") }.to raise_error(RuntimeError)
+    end
+
+    it "raises an error if keys are duplicated" do
+      expect { iid2cbor(yang_schema, "/ietf-routing:routing/control-plane-protocols/control-plane-protocol[type='routing-protocol'][type=0]") }.to raise_error(RuntimeError)
     end
 end

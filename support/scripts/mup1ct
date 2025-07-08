@@ -12,6 +12,8 @@ require 'uri'
 require 'base64'
 require 'shellwords'
 require "nokogiri"
+require_relative "../libeasy/handler.rb"
+require_relative '../libeasy/frame/coap.rb'
 
 USAGE = <<-USAGE
 mup1ct - Microchip UART Protocol 1 client tool
@@ -39,6 +41,7 @@ up the URL can be specified as human-readable parameters.
 Usage:
   mup1ct [options] ping
   mup1ct [options] coap (get|put|del|post) <URL-PATH> [--content-type <NUM>] [--accept <NUM>]
+  mup1ct [options] coaps (get|put|del|post) <URL-PATH> [--content-type <NUM>] [--accept <NUM>]
   mup1ct [options] cc (get|put|del|post|fetch|ipatch) [--content-type <NUM>] [--accept <NUM>]
                                                       [--ds <DS>] --sid <SID> [--keys <type:val>[,...]] [--flags <FF>]
   mup1ct [options] sysrq stack-usage-every <N>
@@ -53,6 +56,8 @@ Options:
                              Ex: termhub://10.0.0.2:4000
   -i --input <FILE>          Read COAP PAYLOAD data from <FILE> instead of STDIN.
   -o --output <FILE>         Write output to <FILE> instead of STDOUT
+  -k --key <FILE.pem>        Uses the specified pem formatted key file as the client key.
+                             Only used by the coaps command.
   -w <VAL>                   How long to wait for responses (in seconds but it
                              may be a floating point number). A value of '-1'
                              means forever.
@@ -101,6 +106,11 @@ Command details:
       --accept       The value to be used in the CoAP Accept option (default depends on the coap request).
                      See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
                      Use a negative value to exclude the Accept option from the CoAP request.
+
+  mup1ct [options] coaps (get|put|del|post) <URL-PATH> <PAYLOAD>
+    Perform a coap request secured by DTLS.
+    Otherwise identical to coap command above.
+    See above for options and parameters.
 
   mup1ct [options] cc (get|put|del|post|fetch|ipatch) --ds <DS> --sid <SID> [--keys <type:val> ...] [--flags <DD> ...]
     Perform a coap request (either get, put, del, post, fetch or ipatch). Parameters are given unencoded in "plain text".
@@ -176,19 +186,21 @@ Command details:
 
   mup1ct [options] sysrq dump <DUMP-SPECIFIER>
     This is used to show switch/PHY state, where <DUMP-SPECIFIER> is defined as:
-      <LAYER>:<GROUP>:<PORT-LIST>:<FLAGS>
+      <LAYER>:<GROUP>:<PORT-LIST>:<FLAGS>:<ACTION>
 
       Where:
         <LAYER>    : Layer, use 'ail' or 'cil' (default is both layers).
         <GROUP>    : Group, use 'get' to see groups (default is all groups).
         <PORT-LIST>: Port list, for example '0,2-5' (default is all ports).
         <FLAGS>    : Flags, 'full' and 'clear' may be used.
+        <ACTION>   : Group specific action code
 
     Examples (abbreviated layer/group/flags are used):
       mup1ct sysrq dump           : Dump all switch state
       mup1ct sysrq dump a:c       : Dump AIL switch counters for all ports
       mup1ct sysrq dump c:c:1,3   : Dump CIL switch counters for port 1 and 3
       mup1ct sysrq dump a:c:1:f   : Dump AIL detailed switch counters for port 1
+      mup1ct sysrq dump a:ac:::2  : Dump AIL ACL policers (action 2)
 
   mup1ct [options] listen
     This command will not issue any requests, but simply listen to the UART line
@@ -299,6 +311,10 @@ OptionParser.new do |opts|
         $opt[:input] = i
     end
 
+    opts.on("-k", "--key <KEY_FILE.pem>", "Read pem formatted key from <KEY_FILE.pem>") do |k|
+        $opt[:pem_key] = k
+    end
+
     opts.on("-o", "--output <FILE>", "Write output to <FILE>") do |o|
         $opt[:output] = o
     end
@@ -357,7 +373,7 @@ else
   $device = $opt[:device]
 end
 
-commands = ["cc", "coap", "sysrq", "listen", "ping"]
+commands = ["cc", "coap", "coaps", "sysrq", "listen", "ping"]
 $cmd = ARGV.shift
 if !commands.include?($cmd)
     puts "command is invalid"
@@ -378,6 +394,12 @@ end
 
 $stdin.binmode
 $stdout.binmode
+$dtls_enable = false
+
+if ($cmd == "coaps")
+    $dtls_enable = true
+    $cmd = "coap"
+end
 
 if ($cmd == "coap")
     $coap_method = ARGV.shift
@@ -1143,6 +1165,90 @@ class MUP1
 
     return ascii
   end
+end # MUP1
+
+class Mup1Con < Et::Handler::Base
+  def initialize lower_layer
+    super "CON"
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_NON_MUP1, self
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_TRACE, self
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_ANNOUNCE, self
+  end
+
+  def rx type, data
+    case type
+    when Et::Handler::Mup1::MUP1_CB_NON_MUP1
+      data.strip!
+      puts "CON: #{data.inspect}" if data.size > 0
+    when Et::Handler::Mup1::MUP1_CB_TRACE
+      puts "TRACE: #{data.inspect}"
+    when Et::Handler::Mup1::MUP1_CB_ANNOUNCE
+      puts "ANNOUNCE: #{data.inspect}"
+    end
+  end
+end
+
+class Dtls_Wrapper
+  class Mup1_Wrapper < Et::Handler::Base
+    def initialize mup1
+      super("MUP1", nil, nil)
+      @mup1 = mup1
+    end
+    def tx type, data = ""
+      @mup1.mup1_frame_inj type, data
+    end
+    def poll
+      timeout = 0.2
+      type , frame = @mup1.mup1_frame_get timeout
+      while (!type.nil?)
+        if type
+          type = type.unpack("C*")[0]
+        end
+        handler_call_rx type, frame
+        
+        type , frame = @mup1.mup1_frame_get timeout
+      end
+    end
+  end
+  class CoAP_Wrapper < Et::Handler::Base
+    def initialize base
+      super("CoAP", base, nil)
+      @rx_type = nil
+      @rx_data = nil
+      ll_handler_reg Et::Handler::Mup1::MUP1_CB_COAP, self
+    end
+    def rx type, data
+      if @rx_type
+        raise "rx over write detected"
+      end
+      @rx_type = type
+      @rx_data = data
+    end
+    def mup1_frame_get timeout_ = nil
+      @rx_type = nil
+      @rx_data = nil
+      ll_poll
+      if @rx_type
+        return [@rx_type].pack("C"), @rx_data
+      end
+    end
+  end
+  def initialize mup1, pem_key
+    @mup1_wrapper = Mup1_Wrapper.new(mup1)
+    @mon = Mup1Con.new @mup1_wrapper
+    config = Et::Handler::Dtls_Config.new pem_key
+    @dtlsHandler = Create_Dtls_Handlers(config, @mup1_wrapper, nil)
+    @coapHandler = CoAP_Wrapper.new(@dtlsHandler)
+  end
+  def mup1_frame_inj type, data = ""
+    if (type == "c")
+      @dtlsHandler.tx data
+    end
+    #@mup1.mup1_frame_inj type, data
+  end
+  def mup1_frame_get timeout_ = nil
+    return @coapHandler.mup1_frame_get timeout_
+  end
 end
 
 def success_detail (detail)
@@ -1239,6 +1345,24 @@ else
   sport = sock.addr[1]
 end
 $mup1 = MUP1.new("easytest", sock)
+
+if ($dtls_enable)
+  pem_key = nil
+  if ($opt[:pem_key] != nil)
+    pem_key = File.read $opt[:pem_key]
+  else
+    key_file_name = "client_key.pem"
+    if (File.exist? key_file_name)
+      pem_key = File.read key_file_name
+    else
+      pem_key = pem_ec_key_gen
+      File.write key_file_name, pem_key
+    end
+  end
+  # Add security layer which should appear identical to $mup1
+  $dtls = Dtls_Wrapper.new($mup1, pem_key)
+  $mup1 = $dtls
+end
 
 if ($cmd == "coap")
   payload_expected = false

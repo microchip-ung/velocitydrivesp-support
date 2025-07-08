@@ -172,6 +172,11 @@ OptionParser.new do |opts|
         $opts[:device] = o
     end
 
+    opts.on("-k", "--key KEY_FILE.pem", "use DTLS with this key file.",
+            "If no key file is provided, try to connect with out DTLS") do |o|
+        $opts[:key] = o
+    end
+
     opts.on("-m", "--method fetch|ipatch|get|put|post|delete", ["fetch", "ipatch", "get", "put", "post", "delete"],
             "CoAP method to process.") do |o|
         $opts[:method] = o
@@ -240,6 +245,15 @@ tracer = Tracer.new $opts[:sys_trace]
 dut = Et::Handler::Dut.new $opts[:device]
 m = Et::Handler::Mup1.new dut, tracer
 mon = Mup1Con.new m
+if $opts[:key] != nil
+    if !(File.exist? $opts[:key])
+        raise "key file '#{$opts[:key]}' not found"
+    end
+    # insert dtls layer
+    pem_key_data = File.read $opts[:key]
+    config = Et::Handler::Dtls_Config.new pem_key_data
+    m = Create_Dtls_Handlers(config, m, tracer)
+end
 coap = Et::Handler::Coap.new m, tracer
 
 ################################################################################
@@ -334,8 +348,14 @@ else
     raise "CoAP method #{$opts[:method]} not implemented!"
 end
 
-if res.code_class != 2
-    STDOUT.printf("ERROR: response code %d.%02d\n", res.code_class, res.code_detail)
+if (res == nil)
+    STDOUT.printf("ERROR: res == nil\n")
+elsif ((res.code_class != nil) && (res.code_detail != nil))
+    if res.code_class != 2
+        STDOUT.printf("ERROR: response code %d.%02d\n", res.code_class, res.code_detail)
+    end
+else
+    STDOUT.printf("ERROR: no response\n")
 end
 
 ################################################################################

@@ -181,6 +181,9 @@ class Module
             stmt.mandatory = mandatory['value'] == 'true'
         end
 
+        status = stm.at_css('> status')
+        stmt.status = status['value'] if status
+
         if ['rpc', 'action'].include? stm.name
             # See RFC 7950 section 7.14. and 7.15.
             stmt.add_child(Statement.new('input')) if stm.at_css('> input').nil?
@@ -194,8 +197,10 @@ class Module
 
             if stm.name == 'choice' and IMPLICIT_CASE_NODES.include? c.name
                 # See RFC 7950 section 7.9.2.
-                stmt.add_child(Statement.new('case', c['name']))
-                    .add_child(interpret_stm(c, modules, groupings))
+                implicit_case = stmt.add_child(Statement.new('case', c['name']))
+                child = implicit_case.add_child(interpret_stm(c, modules, groupings))
+                # Implicit case statements should have the same "status" as the data node it represents.
+                implicit_case.status = child.status
             elsif SCHEMA_NODES.include? c.name
                 stmt.add_child(interpret_stm(c, modules, groupings))
             elsif c.name == 'uses'
@@ -510,13 +515,14 @@ end
 
 class Statement
     attr_reader   :kw, :substms, :tags
-    attr_accessor :arg, :description, :config, :default, :type, :keys, :parent, :sid, :mandatory
+    attr_accessor :arg, :description, :config, :default, :type, :keys, :parent, :sid, :mandatory, :status
 
     def initialize(keyword, arg = nil)
         @kw = keyword
         @arg = arg
         @substms = []
         @config = true
+        @status = "current"
         @tags = {}
     end
 

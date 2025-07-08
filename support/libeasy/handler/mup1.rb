@@ -17,6 +17,7 @@ module Et
 
       MUP1_CB_ANNOUNCE = 0x41
       MUP1_CB_COAP = 0x43
+      MUP1_CB_DTLS = 0x44
       MUP1_CB_PING = 0x50
       MUP1_CB_TRACE = 0x54
       MUP1_CB_NON_MUP1 = 0
@@ -77,15 +78,19 @@ module Et
         timeout_relative_set(timeout)
       end
 
+      def rx_sm_sof 
+        @state = :sof 
+        @mup1_data = [] 
+        @mup1_data_chk = [MUP1_SOF] 
+        @mup1_chk = [] 
+        @mup1_type = 0 
+      end 
+
       def rx_sm c
         case @state
         when :init
           if c == MUP1_SOF
-            @state = :sof
-            @mup1_data = []
-            @mup1_data_chk = [MUP1_SOF]
-            @mup1_chk = []
-            @mup1_type = 0
+            rx_sm_sof()
           end
 
         when :sof
@@ -117,7 +122,11 @@ module Et
                 @mup1_data_chk << MUP1_EOF
               end
 
-            when MUP1_SOF, 0, 0xff
+            when MUP1_SOF
+              t(:info, "Unexpected start of frame, aborting current frame")
+              rx_sm_sof()
+
+            when 0, 0xff
               t(:err, "invalid data element: '#{c}'")
               @state = :init
 

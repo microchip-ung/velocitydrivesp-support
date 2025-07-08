@@ -30,7 +30,7 @@ fi
 
 # Jenkins uses the pre-created user
 if [[ "$BLD_USER" != "jenkins" ]]; then
-    deluser jenkins > /dev/null
+    deluser jenkins > /dev/null 2> /dev/null
 fi
 
 if [[ "$BLD_USER" != "root" ]]; then

@@ -168,51 +168,51 @@ If no yang files, the default schema is used.
     end
 end
 
-def json2cbor_hash(node, json, content_format)
+def json2cbor_hash(node, json, content_format, continue_on_error)
     result = {}
     json.each do |key, value|
         child = node.substms.find { |s| s.arg == key }
         if child.nil?
-            STDERR.puts "Can't find #{key} in #{node.kw} #{node.arg}, skipping..."
+            print_error("Can't find #{key} in #{node.kw} #{node.arg}, skipping...", continue_on_error)
             next
         elsif child.sid.nil?
-            STDERR.puts "#{child.kw} #{child.arg} in #{node.kw} #{node.arg}: missing SID, skipping..."
+            print_error("#{child.kw} #{child.arg} in #{node.kw} #{node.arg}: missing SID, skipping...", continue_on_error)
             next
         end
         delta_sid = child.sid - node.sid
-        result[delta_sid] = json2cbor(child, value, content_format)
+        result[delta_sid] = json2cbor(child, value, content_format, continue_on_error)
     end
     return result
 end
 
-def json2cbor_array(node, json, content_format)
+def json2cbor_array(node, json, content_format, continue_on_error)
     return json.map do |entry|
         result = {}
         entry.each do |key, value|
             child = node.substms.find { |s| s.arg == key }
             if child.nil?
-                STDERR.puts "Can't find #{key} in #{node.kw} #{node.arg}, skipping..."
+                print_error("Can't find #{key} in #{node.kw} #{node.arg}, skipping...", continue_on_error)
                 next
             elsif child.sid.nil?
-                STDERR.puts "#{child.kw} #{child.arg} in #{node.kw} #{node.arg}: missing SID, skipping..."
+                print_error("#{child.kw} #{child.arg} in #{node.kw} #{node.arg}: missing SID, skipping...", continue_on_error)
                 next
             end
             delta_sid = child.sid - node.sid
-            result[delta_sid] = json2cbor(child, value, content_format)
+            result[delta_sid] = json2cbor(child, value, content_format, continue_on_error)
         end
         result
     end
 end
 
-def json2cbor(node, json, content_format)
+def json2cbor(node, json, content_format, continue_on_error)
     node.sid = 0 if node.kw == 'module'
     case node.kw
     when 'module', 'container', 'input', 'output'
         result = {}
         if json.is_a? Hash
-            result = json2cbor_hash(node, json, content_format)
+            result = json2cbor_hash(node, json, content_format, continue_on_error)
         else
-            STDERR.puts "In #{node.kw} #{node.arg}: expected Hash but found #{json.class}"
+            print_error("In #{node.kw} #{node.arg}: expected Hash but found #{json.class}", continue_on_error)
         end
         result
 
@@ -220,31 +220,31 @@ def json2cbor(node, json, content_format)
         result = []
         if ['fetch', 'ipatch'].include?(content_format)
             if json.is_a? Array
-                result = json2cbor_array(node, json, content_format)
+                result = json2cbor_array(node, json, content_format, continue_on_error)
             elsif json.is_a? Hash
-                result = json2cbor_hash(node, json, content_format)
+                result = json2cbor_hash(node, json, content_format, continue_on_error)
             else
-                STDERR.puts "In #{node.kw} #{node.arg}: expected Array or Hash but found #{json.class}"
+                print_error("In #{node.kw} #{node.arg}: expected Array or Hash but found #{json.class}", continue_on_error)
             end
         else
             if json.is_a? Array
-                result = json2cbor_array(node, json, content_format)
+                result = json2cbor_array(node, json, content_format, continue_on_error)
             else
-                STDERR.puts "In #{node.kw} #{node.arg}: expected Array but found #{json.class}"
+                print_error("In #{node.kw} #{node.arg}: expected Array but found #{json.class}", continue_on_error)
             end
         end
         result
 
     when 'leaf'
-        return type2cbor(node.type, json)
+        return type2cbor(node.type, json, continue_on_error)
 
     when 'leaf-list'
-        return json.map {|entry| type2cbor(node.type, entry)}
+        return json.map {|entry| type2cbor(node.type, entry, continue_on_error)}
 
     when 'anydata'
         if node.arg == 'board:factory_default_config'
             ds_schema = yang_schema_get
-            return json2cbor(ds_schema, json, content_format)
+            return json2cbor(ds_schema, json, content_format, continue_on_error)
         end
 
     when 'rpc', 'action'
@@ -255,7 +255,7 @@ def json2cbor(node, json, content_format)
                 # TODO jea: Replace with RFC xxxx above when ready
                 saved_sid = child.sid # Save child.sid for later restore
                 child.sid = node.sid
-                result = json2cbor(child, json.values[0], content_format)
+                result = json2cbor(child, json.values[0], content_format, continue_on_error)
                 child.sid = saved_sid # Restore child.sid
                 return result
             end
@@ -267,7 +267,7 @@ def json2cbor(node, json, content_format)
     end
 end
 
-def type2cbor(type, value, schema = nil, unions = [])
+def type2cbor(type, value, continue_on_error = false, unions = [])
     begin
         case type.name
 
@@ -337,7 +337,7 @@ def type2cbor(type, value, schema = nil, unions = [])
             Integer(value) # See RFC 7951 section 6.1.
 
         when 'leafref'
-            type2cbor(type.deref.type, value, schema, unions)
+            type2cbor(type.deref.type, value, continue_on_error, unions)
 
         when 'int8', 'int16', 'int32', 'uint8', 'uint16', 'uint32'
             value
@@ -346,7 +346,7 @@ def type2cbor(type, value, schema = nil, unions = [])
             t = type.members.find {|t| match_type_json(t, value)}
             # One type is guaranteed to match because the input has been schema validated.
             unions << type
-            result = type2cbor(t, value, schema, unions)
+            result = type2cbor(t, value, continue_on_error, unions)
             unions.pop
             result
 
@@ -371,13 +371,12 @@ def type2cbor(type, value, schema = nil, unions = [])
             value
 
         when 'instance-identifier'
-            raise "Missing schema!" if schema.nil?
-            val, _ = iid2cbor(schema, value)
+            val, _ = iid2cbor(yang_schema_get, value)
             val
 
         end
     rescue => e
-        STDERR.puts "Error encoding #{value or "nil"} as type #{type ? type.name : "nil"}: #{e.message}"
+        print_error("Error encoding #{value or "nil"} as type #{type ? type.name : "nil"}: #{e.message}", continue_on_error)
         return value
     end
 end
@@ -453,6 +452,16 @@ end
 # Convert a YANG instance-identifier in JSON format to CBOR
 # See RFC 7951 section 6.11.
 def iid2cbor(schema, iid)
+    s, all_keys = json_validate_iid(schema, iid)
+    cbor_keys = all_keys.map{|(name, value, type)| type2cbor(type, convert_iid_key_value(type, name, value))}
+    if cbor_keys.empty?
+        return s.sid, s
+    else
+        return cbor_keys.unshift(s.sid), s
+    end
+end
+
+def json_validate_iid(schema, iid)
     s = schema
     found = []
     all_keys = []
@@ -463,32 +472,52 @@ def iid2cbor(schema, iid)
         found << e
         s = c
 
+        raise "Duplicate keys in #{iid}" if keys.map(&:first).uniq.size != keys.map(&:first).size
+
         keys.each do |k|
-            ck = s.substms.find{|x| x.arg == k[0]}
-            raise "Could not find key: #{k[0]} /#{(found + [e]).join("/")} in schema tree" if ck.nil?
-            all_keys << type2cbor(ck.type, convert_iid_key_value(ck.type, k[0], k[1]))
+          ck = c.keys&.find{|x| x == k[0]}
+          raise "Could not find key: #{k[0]} /#{found.join("/")} in schema tree" if ck.nil?
+        end
+
+        c.keys&.each do |k|
+            kv = keys.find{|x| x[0] == k}
+            if kv
+                kv << c.substms.find{|x| x.arg == k}.type
+                all_keys << kv
+            end
         end
     end
-    val = s.sid
-    val = all_keys.unshift s.sid if all_keys.size > 0
-    return val, s
+    return s, all_keys
 end
 
 # Validate JSON data against schema
-def json_validate(schema, json, content_format, continue_on_error)
-    json_schema = to_json_schema(schema, content_format)
-    schemer = JSONSchemer.schema(json_schema)
-    errors = false
-    schemer.validate(json).each do |error|
-        errors = true
-        STDERR.puts JSONSchemer::Errors.pretty(error)
-    end
-    if errors
-        if continue_on_error
-            puts "Errors in JSON data"
-        else
-            raise "Errors in JSON data"
+def json_validate(schema, json, content_format, continue_on_error = false)
+    def validate(schema, json, content_format, continue_on_error)
+        json_schema = to_json_schema(schema, content_format)
+        schemer = JSONSchemer.schema(json_schema)
+        errors = false
+        schemer.validate(json).each do |error|
+            errors = true
+            STDERR.puts JSONSchemer::Errors.pretty(error)
         end
+        print_error("Errors in JSON data", continue_on_error) if errors
+    end
+
+    case content_format
+    when 'fetch', 'ipatch', 'post'
+        raise "Input is not an Array!" if !json.is_a? Array
+        json.each do |j|
+            next if content_format == 'fetch' and j.is_a? String
+            print_error("YANG instance must be a single JSON map!", continue_on_error) if !j.is_a?(Hash) or j.length != 1
+            key = j.keys[0]
+            value = j.values[0]
+            iid_schema, _ = json_validate_iid(schema, key)
+            validate(iid_schema, value, content_format, continue_on_error) if !value.nil? or content_format == 'post'
+        end
+    when 'yang', 'get', 'put'
+        validate(schema, json, content_format, continue_on_error)
+    else
+        print_error("Invalid content_format #{content_format}!", continue_on_error)
     end
 end
 
@@ -496,24 +525,23 @@ end
 # Validation of a null value is skipped in all other than 'post' content formats,
 # as a null value is always valid in content formats like 'fetch' and 'ipatch'.
 def instance2cbor(schema, json, content_format, continue_on_error)
-    raise "YANG instance must be a single JSON map!" if !json.is_a? Hash or json.length != 1
     key = json.keys[0]
     value = json.values[0]
     key_part, iid_schema = iid2cbor(schema, key)
     val_part = nil
     if !value.nil? or content_format == 'post'
-        json_validate(iid_schema, value, content_format, continue_on_error)
-        val_part = json2cbor(iid_schema, value, content_format)
+        val_part = json2cbor(iid_schema, value, content_format, continue_on_error)
     end
     return {key_part => val_part}
 end
 
 # Parse the different JSON content formats and convert to binary CBOR data
 def json_seq2cbor(schema, json, content_format, continue_on_error = false)
+    json_validate(schema, json, content_format, continue_on_error)
+
     buf = "".b
     case content_format
     when 'fetch'
-        raise "Input is not an Array!" if !json.is_a? Array
         json.each do |j|
             if j.is_a? Hash
                 buf << CBOR.encode(instance2cbor(schema, j, content_format, continue_on_error))
@@ -522,18 +550,10 @@ def json_seq2cbor(schema, json, content_format, continue_on_error = false)
                 buf << CBOR.encode(val)
             end
         end
-    when 'ipatch'
-        raise "Input is not an Array!" if !json.is_a? Array
-        json.each { |j| buf << CBOR.encode(instance2cbor(schema, j, content_format, continue_on_error)) }
-    when 'post'
-        raise "Input is not an Array!" if !json.is_a? Array
+    when 'ipatch', 'post'
         json.each { |j| buf << CBOR.encode(instance2cbor(schema, j, content_format, continue_on_error)) }
     when 'yang', 'get', 'put'
-        raise "Input is not a Hash!" if !json.is_a? Hash
-        json_validate(schema, json, content_format, continue_on_error)
-        buf << CBOR.encode(json2cbor(schema, json, content_format))
-    else
-        raise "Invalid content_format #{content_format}!"
+        buf << CBOR.encode(json2cbor(schema, json, content_format, continue_on_error))
     end
     return buf
 end
@@ -628,53 +648,53 @@ def split_iid(iid)
     return sid, keys
 end
 
-def cbor2json_hash(node, cbor, content_format)
+def cbor2json_hash(node, cbor, content_format, continue_on_error)
     result = {}
     cbor.each do |sid, value|
         if !sid.is_a? Integer
-            STDERR.puts "In #{node.kw} #{node.arg}: expected SID but found #{sid.class}, skipping..."
+            print_error("In #{node.kw} #{node.arg}: expected SID but found #{sid.class}, skipping...", continue_on_error)
             next
         end
         absolute_sid = sid + node.sid
         child = node.substms.find { |c| c.sid == absolute_sid }
         if child.nil?
-            STDERR.puts "Can't find SID #{absolute_sid} in #{node.kw} #{node.arg}, skipping..."
+            print_error("Can't find SID #{absolute_sid} in #{node.kw} #{node.arg}, skipping...", continue_on_error)
             next
         end
-        result[child.arg] = cbor2json(child, value, content_format)
+        result[child.arg] = cbor2json(child, value, content_format, continue_on_error)
     end
     result
 end
 
-def cbor2json_array(node, cbor, content_format)
+def cbor2json_array(node, cbor, content_format, continue_on_error)
     return cbor.map do |entry|
         result = {}
         entry.each do |sid, value|
             if !sid.is_a? Integer
-                STDERR.puts "In #{node.kw} #{node.arg}: expected SID but found #{sid.class}, skipping..."
+                print_error("In #{node.kw} #{node.arg}: expected SID but found #{sid.class}, skipping...", continue_on_error)
                 next
             end
             absolute_sid = sid + node.sid
             child = node.substms.find { |c| c.sid == absolute_sid }
             if child.nil?
-                STDERR.puts "Can't find SID #{absolute_sid} in #{node.kw} #{node.arg}, skipping..."
+                print_error("Can't find SID #{absolute_sid} in #{node.kw} #{node.arg}, skipping...", continue_on_error)
                 next
             end
-            result[child.arg] = cbor2json(child, value, content_format)
+            result[child.arg] = cbor2json(child, value, content_format, continue_on_error)
         end
         result
     end
 end
 
-def cbor2json(node, cbor, content_format)
+def cbor2json(node, cbor, content_format, continue_on_error)
     node.sid = 0 if node.kw == 'module'
     case node.kw
     when 'module', 'container', 'input', 'output'
         result = {}
         if cbor.is_a? Hash
-            result = cbor2json_hash(node, cbor, content_format)
+            result = cbor2json_hash(node, cbor, content_format, continue_on_error)
         else
-            STDERR.puts "In #{node.kw} #{node.arg}: expected Hash but found #{cbor.class}"
+            print_error("In #{node.kw} #{node.arg}: expected Hash but found #{cbor.class}", continue_on_error)
         end
         result
 
@@ -682,31 +702,31 @@ def cbor2json(node, cbor, content_format)
         result = []
         if ['fetch', 'ipatch'].include?(content_format)
             if cbor.is_a? Array
-                result = cbor2json_array(node, cbor, content_format)
+                result = cbor2json_array(node, cbor, content_format, continue_on_error)
             elsif cbor.is_a? Hash
-                result = cbor2json_hash(node, cbor, content_format)
+                result = cbor2json_hash(node, cbor, content_format, continue_on_error)
             else
-                STDERR.puts "In #{node.kw} #{node.arg}: expected Array or Hash but found #{cbor.class}"
+                print_error("In #{node.kw} #{node.arg}: expected Array or Hash but found #{cbor.class}", continue_on_error)
             end
         else
             if cbor.is_a? Array
-                result = cbor2json_array(node, cbor, content_format)
+                result = cbor2json_array(node, cbor, content_format, continue_on_error)
             else
-                STDERR.puts "In #{node.kw} #{node.arg}: expected Array but found #{cbor.class}"
+                print_error("In #{node.kw} #{node.arg}: expected Array but found #{cbor.class}", continue_on_error)
             end
         end
         result
 
     when 'leaf'
-        return type2json(node.type, cbor)
+        return type2json(node.type, cbor, continue_on_error)
 
     when 'leaf-list'
-        return cbor.map {|entry| type2json(node.type, entry)}
+        return cbor.map {|entry| type2json(node.type, entry, continue_on_error)}
 
     when 'anydata'
         if node.arg == 'board:factory_default_config'
             ds_schema = yang_schema_get
-            return cbor2json(ds_schema, cbor, content_format)
+            return cbor2json(ds_schema, cbor, content_format, continue_on_error)
         end
 
     when 'rpc', 'action'
@@ -754,7 +774,7 @@ def cbor2json(node, cbor, content_format)
         # TODO jea: Replace with RFC xxxx above when ready
         saved_sid = parent.sid # Save parent.sid for later restore
         parent.sid = node.sid
-        result[parent.kw] = cbor2json(parent, cbor, content_format)
+        result[parent.kw] = cbor2json(parent, cbor, content_format, continue_on_error)
         parent.sid = saved_sid # Restore parent.sid
         result
 
@@ -766,10 +786,10 @@ end
 # Convert CBOR data to JSON
 # Validation of a null value is skipped in all other than 'post' content formats,
 # as a null value is always valid in content formats like 'fetch' and 'ipatch'.
-def instance2json(schema, cbor, content_format)
+def instance2json(schema, cbor, content_format, continue_on_error)
     result = {}
     if !cbor.is_a? Hash or cbor.length != 1
-        STDERR.puts "YANG instance must be a single CBOR map!"
+        print_error("YANG instance must be a single CBOR map!", continue_on_error)
         return result
     end
     key = cbor.keys[0]
@@ -778,7 +798,7 @@ def instance2json(schema, cbor, content_format)
     value = cbor.values[0]
     json_key = iid2json(schema, key)
     if !value.nil? or content_format == 'post'
-        result[json_key] = cbor2json(node, value, content_format)
+        result[json_key] = cbor2json(node, value, content_format, continue_on_error)
     else
         result[json_key] = nil
     end
@@ -787,38 +807,38 @@ end
 
 # Convert CBOR sequence to JSON depending on the content format
 # Note that CBOR is always an array even if there is only one CBOR item
-def cbor_seq2json(schema, cbor, content_format)
+def cbor_seq2json(schema, cbor, content_format, continue_on_error = false)
     result = []
     case content_format
     when 'fetch'
         cbor.each do |c|
             if c.is_a? Hash
-                result << instance2json(schema, c, content_format) # FETCH response
+                result << instance2json(schema, c, content_format, continue_on_error) # FETCH response
             else
                 result << iid2json(schema, c) # FETCH request
             end
         end
         return result
     when 'ipatch'
-        cbor.each { |c| result << instance2json(schema, c, content_format) } # iPATCH request
+        cbor.each { |c| result << instance2json(schema, c, content_format, continue_on_error) } # iPATCH request
         return result
     when 'post'
-        cbor.each { |c| result << instance2json(schema, c, content_format) } # POST request
+        cbor.each { |c| result << instance2json(schema, c, content_format, continue_on_error) } # POST request
         return result
     when 'yang', 'get', 'put'
         if cbor.length != 1
-            STDERR.puts "content format 'yang' does not support CBOR sequences!"
+            print_error("content format 'yang' does not support CBOR sequences!", continue_on_error)
             return result
         end
-        cbor.each { |c| result << cbor2json(schema, c, content_format) }
+        cbor.each { |c| result << cbor2json(schema, c, content_format, continue_on_error) }
         return result[0]
     else
-        STDERR.puts "Invalid content_format #{content_format}!"
+        print_error("Invalid content_format #{content_format}!", continue_on_error)
         return result
     end
 end
 
-def type2json(type, value, schema = nil)
+def type2json(type, value, continue_on_error = false)
     begin
         case type.name
 
@@ -863,7 +883,7 @@ def type2json(type, value, schema = nil)
             positions.map {|p| type.bits.values.find {|b| b.position == p}.name}.join(' ')
 
         when 'leafref'
-            type2json(type.deref.type, value)
+            type2json(type.deref.type, value, continue_on_error)
 
         when 'identityref'
             sid = value
@@ -873,17 +893,17 @@ def type2json(type, value, schema = nil)
 
         when 'union'
             t = type.members.find {|t| match_type_cbor(t, value)}
-            type2json(t, value)
+            type2json(t, value, continue_on_error)
 
         when 'decimal64'
             decode_decimal64(value)
 
         when 'instance-identifier'
-            iid2json(schema ? schema : yang_schema_get, value)
+            iid2json(yang_schema_get, value)
 
         end
     rescue => e
-        STDERR.puts "Error decoding #{value or "nil"} as type #{type ? type.name : "nil"}: #{e.message}"
+        print_error("Error decoding #{value or "nil"} as type #{type ? type.name : "nil"}: #{e.message}", continue_on_error)
         return value
     end
 end
@@ -1132,8 +1152,9 @@ def type2schema(type)
             :contentEncoding => 'base64',
             :anyOf => type.length.map {|l|
                 {
-                    :minLength => l.min,
-                    :maxLength => l.max
+                    # n bytes encode to 4 * ceil(n/3) base64 chars
+                    :minLength => 4 * ((l.min + 2) / 3),
+                    :maxLength => 4 * ((l.max + 2) / 3)
                 }
             }
         }
@@ -1183,6 +1204,14 @@ def type2schema(type)
     else
         { :type => 'string' }
 
+    end
+end
+
+def print_error msg, continue_on_error
+    if continue_on_error
+        STDERR.puts msg
+    else
+        raise msg
     end
 end
 

@@ -103,7 +103,7 @@ module Et
                 return @req_timer, @last_frame
               else
                 #puts "next-step -> STOP retrying"
-                @base.t(:warn, "Giving up!")
+                @base.t(:err, "Giving up!")
                 @req_timer = nil
                 return nil, nil
               end
@@ -194,7 +194,13 @@ module Et
 
       def initialize lower_layer, tracer = nil
         super "CoAP", lower_layer, tracer
-        ll_handler_reg Mup1::MUP1_CB_COAP, self
+        if lower_layer.instance_of? Mup1
+          ll_handler_reg Mup1::MUP1_CB_COAP, self
+        elsif lower_layer.instance_of? Dtls_Application
+          ll_handler_reg 0, self
+        else
+          t(:err, "Coap.initialize: lower_layer is unknown");
+        end
       end
 
       def rx type, data
@@ -256,8 +262,14 @@ module Et
       def tx frame
         if frame
           t(:info, "TX: #{frame.to_s}")
-          # TODO, fix magic number
-          ll_tx 0x63, frame.enc
+          if @lower_layer.instance_of? Mup1
+            # TODO, fix magic number
+            ll_tx 0x63, frame.enc
+          elsif @lower_layer.instance_of? Dtls_Application
+            ll_tx frame.enc
+          else
+            t(:err, "Coap.initialize: lower_layer is unknown");
+          end
         end
       end
 

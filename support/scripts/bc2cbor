@@ -68,7 +68,7 @@ def main
 
   bc_schema = generate_yang_schema("#{top}/docs/sw_refs/yang",
                                    ["#{top}/docs/sw_refs/yang/board.yang"],
-                                   ["#{top}/docs/sw_refs/yang/board@2025-03-31.sid"])
+                                   ["#{top}/docs/sw_refs/yang/board@2025-06-30.sid"])
   json_schema = to_json_schema(bc_schema, 'yang')
   schemer = JSONSchemer.schema(json_schema)
 
