@@ -1,0 +1,47 @@
+---
+- "/ietf-interfaces:interfaces/interface":
+  - name: L3V1
+    type: iana-if-type:l3ipvlan
+    oper-status: up
+    if-index: 10001
+    phys-address: 12-4C-AE-C0-BC-00
+    statistics:
+      in-octets: '0'
+      in-unicast-pkts: '0'
+      in-broadcast-pkts: '0'
+      in-multicast-pkts: '0'
+      in-discards: 0
+      in-errors: 0
+      in-unknown-protos: 0
+      out-octets: '0'
+      out-unicast-pkts: '0'
+      out-broadcast-pkts: '0'
+      out-multicast-pkts: '0'
+      out-discards: 0
+      out-errors: 0
+    ietf-ip:ipv4:
+      address:
+      - ip: 10.0.0.1
+        prefix-length: 24
+        origin: static
+      neighbor: []
+      mchp-velocitysp-ip:statistics:
+        rx-total: '0'
+        rx-octets: '0'
+        rx-hdr-errors: '0'
+        rx-addr-errors: '0'
+        rx-forwards: '0'
+        rx-no-routes: '0'
+        rx-unknown-protos: '0'
+        rx-delivers: '0'
+        tx-requests: '0'
+        tx-forwards: '0'
+        tx-total: '0'
+        tx-octets: '0'
+    mchp-velocitysp-dhcp:dhcp:
+      client:
+        config:
+          enabled: false
+        status:
+          state: DISABLED
+          server-ip: 0.0.0.0

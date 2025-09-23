@@ -1,0 +1,7 @@
+- ? "/ietf-interfaces:interfaces/interface[name='L3V1']"
+  : name: "L3V1"
+    type: iana-if-type:l3ipvlan
+    ietf-ip:ipv4:
+      address:
+      - ip: "10.0.0.1"
+        prefix-length: 24
