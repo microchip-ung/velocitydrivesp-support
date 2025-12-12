@@ -1145,7 +1145,7 @@ class MUP1
   end
 
   def write s
-    puts s
+    #STDERR.puts s
     @stream.write s
     @stream.flush
   end

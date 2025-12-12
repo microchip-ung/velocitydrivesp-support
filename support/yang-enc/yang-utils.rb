@@ -74,12 +74,12 @@ class ModuleSet
         # There are no cycles in the dependency graph. See RFC 7950 section 5.1.
         sorted = self.tsort
         sorted.each {|mod| mod.interpret(self)}
-        sorted.each do |mod| # TODO: rewrite interpret into a pure function that threads a context to handle deviations and augments
+        sorted.each do |mod|
             mod.ast.css('> deviation').each do |deviation|
                 mod.interpret_deviation(deviation, self)
             end
         end
-        sorted.each {|mod| mod.resolve_leafref(mod.schema)}
+        sorted.each {|mod| mod.resolve_leafref(mod.schema, self)}
         return self
     end
 
@@ -141,7 +141,9 @@ class Module
         if self.prefix == prefix
             self
         else
-            modules.find_module(@imports[prefix])
+            mod_name = @imports[prefix]
+            raise "Prefix '#{prefix}' not found in module #{self.name}" if mod_name.nil?
+            modules.find_module(mod_name)
         end
     end
 
@@ -170,7 +172,6 @@ class Module
 
         stm.css('> default').each do |default|
             stmt.default = default['value']
-            #TODO: default should come from type if no default specified?
         end
 
         stm.css('> type').each do |type|
@@ -215,8 +216,6 @@ class Module
                     groupings << grouping
                     interpret_augment(augment, modules, groupings)
                 end
-
-                resolve_leafref(grouping, true) if groupings.empty?
             end
         end
 
@@ -279,8 +278,7 @@ class Module
             target = dst_mod.schema.resolve_schema_path(schema_path)
         end
 
-        # TODO: throw an exception?
-        puts "Augment: #{augment['target-node']} not found! #{schema_path}" if target.nil?
+        raise "Augment: #{augment['target-node']} not found! #{schema_path}" if target.nil?
 
         interpret_stm(augment, modules, groupings).substms.each do |c|
             if dst_mod == self
@@ -298,8 +296,9 @@ class Module
     def interpret_deviation(deviation, modules)
         dst_mod, schema_path = schema_node_id2schema_path(deviation['target-node'], modules)
         target = dst_mod.schema.resolve_schema_path(schema_path)
-
-        puts "Deviation: #{deviation['target-node']} not found! #{schema_path}" if target.nil?
+        if target.nil?
+            raise "Deviation: #{deviation['target-node']} not found! #{schema_path}"
+        end
 
         deviation.css('> deviate').each do |deviate|
             case deviate['value']
@@ -314,8 +313,7 @@ class Module
                     target.type = interpret_type(type, modules)
                 end
             when 'add', 'delete'
-                # TODO: throw an exception?
-                abort("UNIMPLEMENTED:L#{__LINE__}: deviate #{deviate['value']} is not implemented!")
+                raise("deviate #{deviate['value']} is not implemented!")
             end
         end
     end
@@ -357,7 +355,16 @@ class Module
         end
 
         type.css('> path').each do |path|
-            t.path = schema_node_id2schema_path(path['value'].gsub(/\[.*\]/, ''), modules)
+            # Remove XPath predicates
+            t.path = path['value'].gsub(/\[.*\]/, '')
+            # Resolve all prefixes in the XPath in the source module
+            # See RFC 7950 section 6.4.1.
+            t.path.gsub!(/(#{IDENTIFIER}):(#{IDENTIFIER})/) do
+                prefix = $1
+                id = $2
+                mod = resolve_prefix(prefix, modules)
+                "#{mod.name}:#{id}"
+            end
         end
 
         type.css('> base').each do |base|
@@ -399,25 +406,67 @@ class Module
         return this
     end
 
-    def resolve_leafref(stm, relative = false)
+    def resolve_leafref(stm, modules)
         if stm.type and stm.type.name == 'leafref'
             return if stm.type.deref
 
-            mod, schema_path = stm.type.path
-
-            if schema_path[0] == '..'
-                stm.type.deref = stm.resolve_schema_path(schema_path)
-                stm.type.path = schema_path
-            elsif not relative
-                stm.type.deref = mod.schema.resolve_schema_path(schema_path)
-                stm.type.path = schema_path
+            schema_node, schema_path = leafref_path_to_schema_path(stm, modules)
+            deref = schema_node.resolve_schema_path(schema_path)
+            if deref.nil?
+                raise "leafref #{stm.arg} in module #{self.name} with schema path '#{schema_path}' could not be resolved"
+            elsif deref.kw != 'leaf' and deref.kw != 'leaf-list'
+                # RFC 7950 section 9.9.2
+                raise "leafref #{stm.arg} refers to #{deref.kw} #{deref.arg}"
             end
+
+            stm.type.deref = deref
+            stm.type.path = schema_path
         else
-            stm.substms.each {|s| resolve_leafref(s, relative)}
+            stm.substms.each {|s| resolve_leafref(s, modules)}
         end
     end
 
     private
+
+    def leafref_path_to_schema_path(context_node, modules)
+        defining_mod = context_node.defining_module_name
+        path = []
+        context_node.type.path.split("/").each do |id|
+            if id =~ /^#{IDENTIFIER}$/
+                path << "#{defining_mod}:#{id}"
+            elsif !id.empty?
+                path << id
+            end
+        end
+
+        curr_node = context_node
+        parent_mod = nil
+        dst_mod = nil
+        schema_path = []
+        path.each do |node_id|
+            if node_id == ".."
+                curr_node = curr_node.parent
+                parent_mod = curr_node.defining_module_name
+                schema_path << node_id
+            elsif node_id =~ /(#{IDENTIFIER}):(#{IDENTIFIER})/
+                prefix = $1
+                id = $2
+                dst_mod = modules.find_module(prefix) if dst_mod.nil?
+                if parent_mod != prefix
+                    parent_mod = prefix
+                    schema_path << node_id
+                else
+                    schema_path << id
+                end
+            end
+        end
+
+        if schema_path.first == ".."
+            return context_node, schema_path
+        else
+            return dst_mod.schema, schema_path
+        end
+    end
 
     def schema_node_id2schema_path(schema_node_id, modules)
         dst_mod = nil
@@ -475,7 +524,6 @@ class Module
     def resolve_typedef(name, stm, modules)
         mod, id = resolve_name(name, modules)
 
-        # TODO: factor this logic into a function that resolve_typedef and resolve_grouping can use
         if mod == self
             stm.ancestors.each do |ancestor|
                 ancestor.css("> typedef[name=\"#{id}\"]").each do |defn|
@@ -574,6 +622,24 @@ class Statement
 
     def add_tag(key, value)
         @tags[key] = value
+    end
+
+    # Returns the name of the module that defined this schema node.
+    # If it was augmented, this may be different from
+    # the module this node is contained within.
+    def defining_module_name
+        node = self
+        while true do
+            if node.kw == "module"
+                return node.arg
+            elsif node.arg =~ /(.+):/
+                return $1
+            elsif node.parent
+                node = node.parent
+            else
+                raise "Schema node '#{node.kw} #{node.arg}' has no parent"
+            end
+        end
     end
 
     protected
@@ -682,12 +748,10 @@ class Type
                     b.position = @bits[b.name].position
                     t.bits[b.name] = b
                 else
-                    #TODO: exception
-                    puts "Invalid bit restriction, bit #{b.name} has changed position from #{@bits[b.name].position} to #{b.position}"
+                    raise "Invalid bit restriction, bit #{b.name} has changed position from #{@bits[b.name].position} to #{b.position}"
                 end
             else
-                #TODO: exception
-                puts "Invalid bit restriction, bit #{b.name} doesn't exist in base type"
+                raise "Invalid bit restriction, bit #{b.name} doesn't exist in base type"
             end
         end
 
@@ -708,12 +772,10 @@ class Type
                     e.value = @enums[b.name].value
                     t.enums[e.name] = e
                 else
-                    #TODO: exception
-                    puts "Invalid enum restriction, enum #{e.name} has changed value from #{@enums[e.name].value} to #{e.value}"
+                    raise "Invalid enum restriction, enum #{e.name} has changed value from #{@enums[e.name].value} to #{e.value}"
                 end
             else
-                #TODO: exception
-                puts "Invalid enum restriction, enum #{e.name} doesn't exist in base type"
+                raise "Invalid enum restriction, enum #{e.name} doesn't exist in base type"
             end
         end
 
@@ -791,5 +853,6 @@ SCHEMA_NODES = ['action', 'container', 'leaf', 'leaf-list', 'list', 'choice', 'c
 DATA_NODES = ['container', 'leaf', 'leaf-list', 'list', 'anydata', 'anyxml']
 IMPLICIT_CASE_NODES = ['anydata', 'anyxml', 'choice', 'container', 'leaf', 'list', 'leaf-list']
 BUILTIN_TYPES = ['binary', 'bits', 'boolean', 'decimal64', 'empty', 'enumeration', 'identityref', 'instance-identifier', 'int8', 'int16', 'int32', 'int64', 'leafref', 'string', 'uint8', 'uint16', 'uint32', 'uint64', 'union']
+IDENTIFIER = /[A-Za-z_][A-Za-z0-9_\-\.]*/
 
 end

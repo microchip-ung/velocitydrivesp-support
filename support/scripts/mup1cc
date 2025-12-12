@@ -149,6 +149,207 @@ def get_device
     return nil
 end
 
+################################################################################
+# Read input from STDIN or a file depending on command line options
+################################################################################
+def input_data_read
+    if $opts[:input_file].nil?
+        # Read from STDIN
+        if $opts[:input_format] == 'json'
+            input_data = JSON.parse(STDIN.read)
+            input_format = 'json'
+        else
+            input_data = YAML.load(STDIN.read) # The default if input_format not specified
+            input_format = 'yaml'
+        end
+    else
+        # Read from input file
+        input_format = $opts[:input_format] # 1. prio
+        input_format = $opts[:input_file].match(/(json|yaml)$/)&.to_s if input_format.nil? # 2. prio
+        input_format = 'yaml' if input_format.nil? # 3. prio
+        if input_format == 'yaml'
+            input_data = YAML.load(File.read($opts[:input_file]))
+        else
+            # Consider to always use YAML.load() as it can read JSON also
+            # https://stackoverflow.com/questions/24608600/is-it-safe-to-parse-json-with-yaml-load
+            input_data = JSON.parse(File.read($opts[:input_file]))
+        end
+    end
+    return input_data, input_format
+end
+
+################################################################################
+# Add query parameters to URL
+################################################################################
+def url_with_query_params url
+    result = url
+    delim = "?"
+    if $opts[:query].length > 0
+        if ['fetch', 'get'].include?($opts[:method])
+            $opts[:query].each do |q|
+                result << "#{delim}#{q}"
+                delim = "&"
+            end
+        else
+            raise "CoAP method #{$opts[:method]} does not support query parameters!"
+        end
+    end
+    return result
+end
+
+################################################################################
+# Run CoAP method
+################################################################################
+def coap_method_run input_data, url, method
+    output_data = nil
+    case method
+    when 'fetch'
+        cbor_req = json_seq2cbor($schema, input_data, method, $opts[:continue_on_error])
+        res = $coap.fetch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_IDENTIFIERS_CBOR})
+        output_data = cbor_seq2json($schema, CBOR.decode_seq(res.payload_rx), method)
+    when 'ipatch'
+        cbor_req = json_seq2cbor($schema, input_data, method, $opts[:continue_on_error])
+        res = $coap.ipatch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
+        if res.payload_rx.length > 0
+            # Eventual output from iPATCH is an error message encoded in CBOR with content_type CT_APPL_YANG_DATA_CBOR
+            output_data = cbor_seq2json($schema, CBOR.decode_seq(res.payload_rx), 'yang')
+        end
+    when 'get'
+        res = $coap.get(url)
+        output_data = cbor_seq2json($schema, CBOR.decode_seq(res.payload_rx), method)
+    when 'put'
+        cbor_req = json_seq2cbor($schema, input_data, method, $opts[:continue_on_error])
+        res = $coap.put(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_DATA_CBOR})
+    when 'post'
+        cbor_req = json_seq2cbor($schema, input_data, method, $opts[:continue_on_error])
+        res = $coap.post(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
+        if res.payload_rx.length > 0
+            output_data = cbor_seq2json($schema, CBOR.decode_seq(res.payload_rx), method)
+        end
+    when 'delete'
+        res = $coap.del(url)
+    else
+        raise "CoAP method #{method} not implemented!"
+    end
+
+    if (res == nil)
+        STDOUT.printf("ERROR: res == nil\n")
+    elsif ((res.code_class != nil) && (res.code_detail != nil))
+        if res.code_class != 2
+            STDOUT.printf("ERROR: response code %d.%02d\n", res.code_class, res.code_detail)
+        end
+    else
+        STDOUT.printf("ERROR: no response\n")
+    end
+
+    return res, output_data
+end
+
+################################################################################
+# Process output
+################################################################################
+def output_data_process output_data
+    if output_data and output_data.any?
+        output_format = nil
+        if $opts[:output_file].nil? or $opts[:log_run]
+            puts "Response payload:" if $opts[:log_run]
+            # Write to STDOUT
+            if $opts[:output_format] == 'json'
+                output_format = 'json'
+                STDOUT.puts(JSON.pretty_generate(output_data))
+            else
+                output_format = 'yaml'
+                STDOUT.puts(output_data.to_yaml) # The default if output_format not specified
+            end
+        else
+            # Write to output file
+            output_format = $opts[:output_format] # 1. prio
+            output_format = $opts[:output_file].match(/(json|yaml)$/)&.to_s if output_format.nil? # 2. prio
+            output_format = 'yaml' if output_format.nil? # 3. prio
+            if output_format == 'yaml'
+                File.write($opts[:output_file], output_data.to_yaml)
+            else
+                File.write($opts[:output_file], JSON.pretty_generate(output_data))
+            end
+        end
+        puts "output_format: #{output_format}" if $opts[:verbose]
+    end
+end
+
+def log_append log, req, resp, resp_code, method, url
+    step = {}
+    step["step"] = log["steps"].size + 1
+
+    if $opts[:log_msg] and $opts[:log_msg].size > 0
+        step["description"] = $opts[:log_msg]
+    end
+
+    step["method"] = method
+
+    if url and url != "c"
+        step["url"] = url
+    end
+
+    step["request"] = req if req
+    step["response"] = resp if resp and resp.any?
+
+    if resp_code
+        step["response-code"] = sprintf("%d.%02d", resp_code.code_class, resp_code.code_detail)
+    end
+
+    log["steps"] << step
+end
+
+def log_run step
+    url = step["url"] || 'c'
+
+    if step["description"]
+        STDOUT.printf("Step %d: %s\n", step["step"], step["description"])
+    else
+        STDOUT.printf("Step %d\n", step["step"])
+    end
+
+    STDOUT.printf("Request method: %s\n", step["method"]);
+    STDOUT.printf("Request URL: %s\n", step["url"]) if step["url"]
+
+    if step["request"]
+        STDOUT.printf("Request payload:\n")
+        if $opts[:output_format] == 'json'
+            STDOUT.puts(JSON.pretty_generate(step["request"]))
+        else
+            STDOUT.puts(step["request"].to_yaml)
+        end
+    end
+
+    res, output_data = coap_method_run(step["request"], url, step["method"])
+    output_data_process(output_data)
+
+    puts "======================================================================"
+end
+
+def parse_step_ranges(str)
+    steps = []
+    str.split(',').each do |part|
+        if part =~ /^(\d+)-(\d+)$/
+            # Range like 5-7
+            start_step, end_step = $1.to_i, $2.to_i
+            if start_step <= end_step
+                steps.concat((start_step..end_step).to_a)
+            else
+                steps.concat(start_step.downto(end_step).to_a)
+            end
+        elsif part =~ /^\d+$/
+            # Single step like 3
+            steps << part.to_i
+        else
+            abort("Invalid step range: #{part}")
+        end
+    end
+
+    return steps if steps.any?
+    return nil
+end
+
 $opts = {:continue_on_error => false,
          :device => get_device,
          :query => [],
@@ -228,6 +429,28 @@ OptionParser.new do |opts|
         $opts[:workspace] = o
     end
 
+    opts.on("--log-append [FILE]", "Append the request to FILE (default: mup1cc.log)",
+            "Will create FILE if it doesn't exist") do |log_file|
+        $opts[:log_append] = log_file || 'mup1cc.log'
+    end
+
+    opts.on("--log-msg STRING", "Store STRING together with the request in the log file.",
+            "Requires --log-append.") do |msg|
+        $opts[:log_msg] = msg
+    end
+
+    opts.on("--log-run [FILE]", "Replay the requests in FILE (default: mup1cc.log)") do |log_file|
+        $opts[:log_run] = log_file || 'mup1cc.log'
+    end
+
+    opts.on("--log-steps STEPS", "Replay only the steps in STEPS.",
+            "STEPS is one or more ranges of steps separated by commas.",
+            "E.g. 3,5-7 means step 3 followed by steps 5, 6, 7.",
+            "7-5,3,9-10 means steps 7, 6, 5 followed by step 3 followed by steps 9 and 10.",
+            "Requires --log-run.") do |str|
+        $opts[:log_steps] = parse_step_ranges(str)
+    end
+
 end.parse!
 
 if $opts[:verbose]
@@ -236,7 +459,7 @@ if $opts[:verbose]
 end
 
 raise "Missing device!" if $opts[:device].nil?
-raise "Missing method!" if $opts[:method].nil?
+raise "Missing method!" if $opts[:method].nil? and $opts[:log_run].nil?
 
 ################################################################################
 # Initialize handler
@@ -254,134 +477,54 @@ if $opts[:key] != nil
     config = Et::Handler::Dtls_Config.new pem_key_data
     m = Create_Dtls_Handlers(config, m, tracer)
 end
-coap = Et::Handler::Coap.new m, tracer
-
-################################################################################
-# Process input if needed
-################################################################################
-input_format = nil
-input_data = nil
-if ['fetch', 'ipatch', 'put', 'post'].include?($opts[:method])
-    if $opts[:input_file].nil?
-        # Read from STDIN
-        if $opts[:input_format] == 'json'
-            input_data = JSON.parse(STDIN.read)
-        else
-            input_data = YAML.load(STDIN.read) # The default if input_format not specified
-        end
-    else
-        # Read from input file
-        input_format = $opts[:input_format] # 1. prio
-        input_format = $opts[:input_file].match(/(json|yaml)$/)&.to_s if input_format.nil? # 2. prio
-        input_format = 'yaml' if input_format.nil? # 3. prio
-        if input_format == 'yaml'
-            input_data = YAML.load(File.read($opts[:input_file]))
-        else
-            # Consider to always use YAML.load() as it can read JSON also
-            # https://stackoverflow.com/questions/24608600/is-it-safe-to-parse-json-with-yaml-load
-            input_data = JSON.parse(File.read($opts[:input_file]))
-        end
-    end
-    puts "input_format: #{input_format}" if $opts[:verbose]
-end
+$coap = Et::Handler::Coap.new m, tracer
 
 ################################################################################
 # Load relevant YANG schema
 ################################################################################
 if $opts[:workspace] == true or ($opts[:workspace].nil? and $topology)
     puts "Use schema based on current workspace" if $opts[:verbose]
-    s = yang_schema_get
+    $schema = yang_schema_get
 else
     # Use schema based on checksum in DUT
-    checksum = fetch_yang_lib_checksum_from_dut(coap)
-    s = get_yang_schema(checksum)
+    checksum = fetch_yang_lib_checksum_from_dut($coap)
+    $schema = get_yang_schema(checksum)
 end
 
 ################################################################################
-# Add query parameters to URL
+# Run from log file or from command line arguments
 ################################################################################
-url = "c"
-delim = "?"
-if $opts[:query].length > 0
-    if ['fetch', 'get'].include?($opts[:method])
-        $opts[:query].each do |q|
-            url << "#{delim}#{q}"
-            delim = "&"
+if $opts[:log_run]
+    log_data = YAML.load_file($opts[:log_run]) || { "steps" => [] }
+    if $opts[:log_steps]
+        $opts[:log_steps].each do |idx|
+            next_step = log_data["steps"].find{|s| s["step"] == idx}
+            log_run(next_step) if next_step
         end
     else
-    raise "CoAP method #{$opts[:method]} does not support query parameters!"
-    end
-end
-puts "URL: #{url}" if $opts[:verbose]
-
-################################################################################
-# Run CoAP method
-################################################################################
-output_data = nil
-case $opts[:method]
-when 'fetch'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
-    res = coap.fetch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_IDENTIFIERS_CBOR})
-    output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
-when 'ipatch'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
-    res = coap.ipatch(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
-    if res.payload_rx.length > 0
-        # Eventual output from iPATCH is an error message encoded in CBOR with content_type CT_APPL_YANG_DATA_CBOR
-        output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), 'yang')
-    end
-when 'get'
-    res = coap.get(url)
-    output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
-when 'put'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
-    res = coap.put(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_DATA_CBOR})
-when 'post'
-    cbor_req = json_seq2cbor(s, input_data, $opts[:method], $opts[:continue_on_error])
-    res = coap.post(url, cbor_req, {:content_type => Et::Frame::Coap::CT_APPL_YANG_INSTANCES_CBOR})
-    if res.payload_rx.length > 0
-        output_data = cbor_seq2json(s, CBOR.decode_seq(res.payload_rx), $opts[:method])
-    end
-when 'delete'
-    res = coap.del(url)
-else
-    raise "CoAP method #{$opts[:method]} not implemented!"
-end
-
-if (res == nil)
-    STDOUT.printf("ERROR: res == nil\n")
-elsif ((res.code_class != nil) && (res.code_detail != nil))
-    if res.code_class != 2
-        STDOUT.printf("ERROR: response code %d.%02d\n", res.code_class, res.code_detail)
+        log_data["steps"].each{|step| log_run(step)}
     end
 else
-    STDOUT.printf("ERROR: no response\n")
-end
+    if ['fetch', 'ipatch', 'put', 'post'].include?($opts[:method])
+        input_data, input_format = input_data_read
+        puts "input_format: #{input_format}" if $opts[:verbose]
+    end
 
-################################################################################
-# Process output
-################################################################################
-if output_data and output_data.any?
-    output_format = nil
-    if $opts[:output_file].nil?
-        # Write to STDOUT
-        if $opts[:output_format] == 'json'
-            output_format = 'json'
-            STDOUT.puts(JSON.pretty_generate(output_data))
+    url = url_with_query_params("c")
+    puts "URL: #{url}" if $opts[:verbose]
+
+    res, output_data = coap_method_run(input_data, url, $opts[:method])
+    output_data_process(output_data)
+
+    if $opts[:log_append]
+        log_file = File.open($opts[:log_append], File::RDWR | File::CREAT)
+        log_data = YAML.load_file(log_file) || { "steps" => [] }
+        log_append(log_data, input_data, output_data, res, $opts[:method], url)
+
+        if $opts[:output_format].nil? or $opts[:output_format] == 'yaml'
+            File.write($opts[:log_append], log_data.to_yaml)
         else
-            output_format = 'yaml'
-            STDOUT.puts(output_data.to_yaml) # The default if output_format not specified
-        end
-    else
-        # Write to output file
-        output_format = $opts[:output_format] # 1. prio
-        output_format = $opts[:output_file].match(/(json|yaml)$/)&.to_s if output_format.nil? # 2. prio
-        output_format = 'yaml' if output_format.nil? # 3. prio
-        if output_format == 'yaml'
-            File.write($opts[:output_file], output_data.to_yaml)
-        else
-            File.write($opts[:output_file], JSON.pretty_generate(output_data))
+            File.write($opts[:log_append], JSON.pretty_generate(log_data))
         end
     end
-    puts "output_format: #{output_format}" if $opts[:verbose]
 end

@@ -27,7 +27,7 @@ dbgreg - Register access debug tool
 
 
 Usage:
-  dbgreg [options] miim [c22|c45]  (<PORT>[:<MMD>]:<REG_ADDR>[=VAL])...
+  dbgreg [options] miim|sw [c22|c45] (<PORT>[:<MMD>]:<ADDR>[=VAL])...
 
 Options:
   -h --help                  Show this screen.
@@ -35,8 +35,15 @@ Options:
                              Ex: termhub://10.0.0.2:4000
 
 Command details:
-  dbgreg [options] miim|sw [(c22|c45)] (<PORT>[:<MMD>]:<REG_ADDR>[=VAL])...
-  Do a MIIM or Switch read or write request
+  Do a MIIM or Switch read or write request.
+  miim: MIIM register access option.
+  sw  : Switch register access option.
+  c22 : Clause 22 MIIM access.
+  c45 : Clause 45 MIIM access.
+  PORT: 0-based switch port number.
+  MMD : MMD (8 bits) for clause 45 access.
+  ADDR: Register address (5/16/32 bits for c22/c45/switch access)
+  VAL : Register value for write operation (16/32 bits for MIIM/switch access)
 USAGE
 
 OptionParser.new do |opts|
@@ -69,6 +76,7 @@ if $cmd == "miim"
     case a
     when "c22"
     when "c45"
+        clause = :c45
 
     when /^(\w+):(\w+):(\w+)=(\w+)$/
       res = [Integer($1, exception: false),
@@ -76,7 +84,7 @@ if $cmd == "miim"
              Integer($3, exception: false),
              Integer($4, exception: false)]
       raise "Did not understand: #{a}" if res.include? nil
-      req << { :port => res[0], :mmd => res[1], :reg => res[2],
+      req << { :port => res[0], :reg => ((res[1] << 16) + res[2]),
                :val => res[3], :clause => clause }
 
     when /^(\w+):(\w+)=(\w+)$/
@@ -84,7 +92,7 @@ if $cmd == "miim"
              Integer($2, exception: false),
              Integer($3, exception: false)]
       raise "Did not understand: #{a}" if res.include? nil
-      req << { :port => res[0], :mmd => 0, :reg => res[2],
+      req << { :port => res[0], :reg => res[2],
                :val => res[2], :clause => clause }
 
     when /^(\w+):(\w+):(\w+)$/
@@ -92,7 +100,7 @@ if $cmd == "miim"
              Integer($2, exception: false),
              Integer($3, exception: false)]
       raise "Did not understand: #{a}" if res.include? nil
-      req << { :port => res[0], :mmd => res[1], :reg => res[2],
+      req << { :port => res[0], :reg => ((res[1] << 16) + res[2]),
                :clause => clause }
 
     when /^(\w+):(\w+)$/
@@ -114,7 +122,7 @@ if $cmd == "miim"
       f += LM_DBG_REG_TYPE_MIIM_C22_RD.to_s
     elsif r[:clause] == :c22 and r[:val]
       f += LM_DBG_REG_TYPE_MIIM_C22_WR.to_s
-    elsif r[:clause] == :c45 and r[:val]
+    elsif r[:clause] == :c45 and r[:val].nil?
       f += LM_DBG_REG_TYPE_MIIM_C45_RD.to_s
     elsif r[:clause] == :c45 and r[:val]
       f += LM_DBG_REG_TYPE_MIIM_C45_WR.to_s
@@ -139,11 +147,49 @@ if $cmd == "miim"
   cmd = "mup1ct #{dev_opts} coap post /dbg/reg --content-type 60 --accept 60"
   puts cmd
   cbor_out, err, status = Open3.capture3(cmd, stdin_data: cbor, binmode: true)
-  puts "Status: #{status.to_i}, stderr: #{err}, got #{cbor_out.size} bytes"
+  puts "Status: #{status.to_i}, stderr: #{err.strip}, got #{cbor_out.size} bytes"
 
   begin
     back = CBOR::decode(cbor_out)
-    pp back
+    #pp back
+    back.each_with_index do |e, idx|
+        hdr = "Oper  Port  "
+        str = ""
+        a = e.values
+        t = a[0]
+        if (t == LM_DBG_REG_TYPE_MIIM_C22_RD || t == LM_DBG_REG_TYPE_MIIM_C45_RD)
+            str += "RD"
+        else
+            str += "WR"
+        end
+        str += ("    %-6u" % a[1])
+        r = a[2]
+        if (t == LM_DBG_REG_TYPE_MIIM_C22_RD || t == LM_DBG_REG_TYPE_MIIM_C22_WR)
+            hdr += "Addr  "
+            str += ("0x%02X  " % r)
+        else
+            hdr += "MMD   Addr    "
+            str += ("0x%02X  " % (r >> 16))
+            str += ("0x%04X  " % (r & 0xffff))
+        end
+        v = a[3]
+        16.times do |i|
+            str += "." if ((i > 0) && (i % 8) == 0)
+            str += (((1 << (15 - i)) & v) > 0 ? "1" : "0")
+        end
+        str += ("  0x%04X" % v)
+        str += "  #{v}"
+        if (idx == 0)
+            puts ""
+            hdr.length.times do
+                print " "
+            end
+            puts "Value              Value   Value"
+            hdr += "15     8.7      0  Hex     Decimal"
+            puts hdr
+        end
+        puts str
+    end
   rescue
     puts "Failed to decode output as cbor"
     o, e, s = Open3.capture3("hexdump -C", stdin_data: cbor_out, binmode: true)
@@ -195,11 +241,30 @@ else
   cmd = "mup1ct #{dev_opts} coap post /dbg/reg --content-type 60 --accept 60"
   puts cmd
   cbor_out, err, status = Open3.capture3(cmd, stdin_data: cbor, binmode: true)
-  puts "Status: #{status.to_i}, stderr: #{err}, got #{cbor_out.size} bytes"
+  puts "Status: #{status.to_i}, stderr: #{err.strip}, got #{cbor_out.size} bytes"
 
   begin
     back = CBOR::decode(cbor_out)
-    pp back
+    #pp back
+    back.each_with_index do |e, idx|
+        if (idx == 0)
+            puts ""
+            puts "                  Value                                Value       Value"
+            puts "Oper  Address     31    24.23    16.15     8.7      0  Hex         Decimal"
+        end
+        a = e.values
+        str = (a[0] == LM_DBG_REG_TYPE_SWITCH_RD ? "RD" : "WR")
+        str += "    "
+        str += ("0x%08X  " % a[1])
+        v = a[2]
+        32.times do |i|
+            str += "." if ((i > 0) && (i % 8) == 0)
+            str += (((1 << (31 - i)) & v) > 0 ? "1" : "0")
+        end
+        str += ("  0x%08X" % v)
+        str += "  #{v}"
+        puts str
+    end
   rescue
     puts "Failed to decode output as cbor"
     o, e, s = Open3.capture3("hexdump -C", stdin_data: cbor_out, binmode: true)

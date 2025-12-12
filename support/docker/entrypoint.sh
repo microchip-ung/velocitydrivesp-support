@@ -48,9 +48,13 @@ unset IFS
 if [[ "$#" -eq "0" ]]; then
     exec runuser --pty "$BLD_USER" --command="cat"
 else
+    if [[ "$#" -eq 1 ]]; then
+        cmd=$1
+    else
+        cmd=$(printf "%q " "$@")
+    fi
     # Run command as user.
     # Create pseudo-terminal for better security on interactive sessions.
-    # Note that "$*" is used here to put all parameter into a single string.
-    exec runuser --pty "$BLD_USER" --command="$*"
+    exec runuser --pty "$BLD_USER" --command="$cmd"
 fi
 
