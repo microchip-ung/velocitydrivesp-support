@@ -26,7 +26,6 @@ module Et
           end
         when nil
           require "serialport"
-          puts "Opening serial port at #{uri}"
           super "UART"
           conf = {
             "baud"      => 115200,

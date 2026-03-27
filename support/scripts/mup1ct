@@ -3,1175 +3,122 @@
 # Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
 # SPDX-License-Identifier: MIT
 
+# mup1ct - MUP1 CoAP/CORECONF client tool using libeasy handlers
+#
+# Adding a new command:
+# 1. Create a command class inheriting from Command:
+#
+#    class MyCommand < Command
+#      def parse_args(argv)
+#        @arg = argv.shift  # parse command-specific arguments
+#      end
+#
+#      def response_wait
+#        context[:wait] || 1  # default timeout in seconds
+#      end
+#
+#      def execute
+#        # Command logic here. Available via context:
+#        #   context[:mup1]        - MUP1 handler for low-level TX/RX
+#        #   context[:dut]         - DUT handler for polling
+#        #   context[:tracer]      - Tracer for debug output
+#        #   context[:ping_handler]- Ping response handler
+#        #   context[:input]       - Input data from -i or stdin
+#        #   context[:output_file] - Output file from -o option
+#        #   context[:wait]        - Wait time from -w option
+#        #   context[:wait_forever]- True if -w -1
+#        #   context[:content_type]- CoAP content-type option
+#        #   context[:accept]      - CoAP accept option
+#        #   context[:sid]         - SID from --sid option
+#        #   context[:keys]        - Keys from --keys option
+#        #   context[:flags]       - Flags from --flags option
+#        #
+#        # Helper methods from base Command class:
+#        #   poll_until(timeout, forever: false) - poll with timeout
+#        #   write_output(data) - write to stdout or -o file
+#      end
+#    end
+#
+# 2. Register in CommandFactory::COMMANDS:
+#
+#    COMMANDS = {
+#      ...
+#      "mycommand" => MyCommand,
+#    }
+#
+
 require 'optparse'
-require 'bit-struct'
-require 'open3'
-require 'socket'
-require 'cbor-pure'
 require 'uri'
 require 'base64'
 require 'shellwords'
 require "nokogiri"
 require_relative "../libeasy/handler.rb"
 require_relative '../libeasy/frame/coap.rb'
+require_relative '../libeasy/cbor-diag.rb'
 
-USAGE = <<-USAGE
-mup1ct - Microchip UART Protocol 1 client tool
+EXAMPLES = <<~EXAMPLES
 
-This tool may be used to connect to UART terminal servers, and inject/extract
-MUP1 packets. This only make sense if the connected device talk the MUP1
-protocol.
+  Examples:
+    mup1ct -d termhub://10.0.0.2:4000 ping
+    mup1ct cc get --sid 7026 | cbor-diag  # Deprecated, mup1cc tool instead
+    mup1ct cc get --sid 5010 --keys s:1 --flags c=n # Deprecated, mup1cc tool instead
+    mup1ct cc fetch --ds c --content-type 141 --accept 142 < payload.cbor # Deprecated, mup1cc tool instead
+    mup1ct coap get .well-known/core
+    mup1ct coap put fw/image < firmware.fip
+    mup1ct trace :                        # Get all trace levels
+    mup1ct trace port:info                # Set port trace to info
+    mup1ct dump "a:port:0::"              # Dump AIL port state for port 0
+    mup1ct dump ":::"                     # Dump all layers, groups, ports
+    mup1ct sysrq trace port:info          # Deprecated, use 'trace' instead
+    mup1ct sysrq dump ":::"               # Deprecated, use 'dump' instead
+EXAMPLES
 
-The tool is designed to ease integration with other tool which can encode or
-decode the relevant CoAP messages. To facilitate this, all non-data is printed
-STDERR (this includes meta data, traces, errors etc).
-
-A common use-case is to do a CoAP/CORECONF get operation, and then use cbor-diag
-to decode the message like this:
-  mup1ct -d termhub://10.0.0.2:4000 -t coap get c/Bty | cbor-diag --from bytes
-
-To help generate the URL-PATH (Bty in above) you can use sid_encode that takes the destination SID as parameter.
-  mup1ct -d termhub://10.205.27.91:4112 coap get c/`sid_encode 7026` | cbor-diag
-
-An easier way to provide is to use the cc command. Then the elements that make 
-up the URL can be specified as human-readable parameters.
-  mup1ct -d termhub://10.205.27.91:4112 coap get --ds c --sid 7026 
-    --keys s:b0,s:c0,i:0,i:1 --flags c=n,d=a | cbor-diag
-
-Usage:
-  mup1ct [options] ping
-  mup1ct [options] coap (get|put|del|post) <URL-PATH> [--content-type <NUM>] [--accept <NUM>]
-  mup1ct [options] coaps (get|put|del|post) <URL-PATH> [--content-type <NUM>] [--accept <NUM>]
-  mup1ct [options] cc (get|put|del|post|fetch|ipatch) [--content-type <NUM>] [--accept <NUM>]
-                                                      [--ds <DS>] --sid <SID> [--keys <type:val>[,...]] [--flags <FF>]
-  mup1ct [options] sysrq stack-usage-every <N>
-  mup1ct [options] sysrq stack-usage-once
-  mup1ct [options] sysrq trace <TRACE-SPECIFIER>
-  mup1ct [options] sysrq dump <DUMP-SPECIFIER>
-  mup1ct [options] listen
-
-Options:
-  -h --help                  Show this screen.
-  -d --device <URL>          IP based terminal device to connect to.
-                             Ex: termhub://10.0.0.2:4000
-  -i --input <FILE>          Read COAP PAYLOAD data from <FILE> instead of STDIN.
-  -o --output <FILE>         Write output to <FILE> instead of STDOUT
-  -k --key <FILE.pem>        Uses the specified pem formatted key file as the client key.
-                             Only used by the coaps command.
-  -w <VAL>                   How long to wait for responses (in seconds but it
-                             may be a floating point number). A value of '-1'
-                             means forever.
-                             Default value is 1 when used with ping/sysrq
-                             Default value assure two retrans when used with coap
-                             Default value is -1 if used with listen.
-  -t --trace                 Any traces received while performing the command
-                             shall be printed on STDERR.
-  -T --trace-timeout <VAL>   Same as the '-t' option, but when used here, the
-                             tool shall wait for <VAL> seconds after the request
-                             has completed to see if more traces are issued.
-                             If <VAL> is a negative number, then any traces
-                             received will reset the timer, if it is positive
-                             then it is an absolute time.
-
-Command details:
-  mup1ct [options] ping
-    Shall issue a mup1 ping request and if a response is received within the
-    timeout it shall write 'PONG in XX ms' on the screen and return '0'. If no
-    response is received it shall 'NO-PONG' and return '1'.
-
-  mup1ct [options] coap (get|put|del|post) <URL-PATH> <PAYLOAD>
-    Perform a coap request (either get, put, del or post) and add an option
-    with the 'uri-path'.
-
-    If the CoAP payload in either direction is bigger than 128 bytes, then
-    blockwise transfers shall be used using a block size of 128 bytes.
-
-    If a response is received (success or error), then the response code shall be
-    printed at STDERR using the format:
-      RESPONSE-CODE: <3-digt-code> <texttual response code>
-    Example:
-      RESPONSE-CODE: 201 Created
-
-    If PAYLOAD data can be read from STDIN, or if the '-i' option is given, then this
-    data shall be included in the request message as payload.
-
-    If any payload is returned it shall be written at STDOUT unless the '-o'
-    option is provided.
-
-    Parameters:
-      --content-type The value to be used in the CoAP Content-Format option (default depends on the coap request).
-                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
-                     Use a negative value to exclude the Content-Format option from the CoAP request.
-
-      --accept       The value to be used in the CoAP Accept option (default depends on the coap request).
-                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
-                     Use a negative value to exclude the Accept option from the CoAP request.
-
-  mup1ct [options] coaps (get|put|del|post) <URL-PATH> <PAYLOAD>
-    Perform a coap request secured by DTLS.
-    Otherwise identical to coap command above.
-    See above for options and parameters.
-
-  mup1ct [options] cc (get|put|del|post|fetch|ipatch) --ds <DS> --sid <SID> [--keys <type:val> ...] [--flags <DD> ...]
-    Perform a coap request (either get, put, del, post, fetch or ipatch). Parameters are given unencoded in "plain text".
-
-    If the CoAP payload in either direction is bigger than 128 bytes, then
-    blockwise transfers shall be used using a block size of 128 bytes.
-
-    If a response is received (success or error), then the response code shall be printed at STDERR using the format:
-      RESPONSE-CODE: <3-digt-code> <texttual response code>
-    Example:
-      RESPONSE-CODE: 201 Created
-
-    If PAYLOAD data can be read from STDIN, or if the '-i' option is given, then this data shall be included in the
-    request message as payload.
-
-    If any payload is returned it shall be written at STDOUT unless the '-o'
-    option is provided.
-
-    Parameters:
-      --content-type The value to be used in the CoAP Content-Format option (default depends on the coap request).
-                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
-                     Use a negative value to exclude the Content-Format option from the CoAP request.
-
-      --accept       The value to be used in the CoAP Accept option (default depends on the coap request).
-                     See https://www.iana.org/assignments/core-parameters/core-parameters.xhtml#content-formats
-                     Use a negative value to exclude the Accept option from the CoAP request.
-
-      --ds    Denotes the datastore to be accessed. If the paramter is 
-              not present, the default datastore is '/c'.
-
-      --sid   The SID to be adressed is given as decimal number.     
-
-      --keys  Query parameter for instance identifier keys
-              Query parameters consist of type and value, which are separated by ':'. Several keys can be concatenated by ','. 
-              Possible types are:
-                s     string value, without quotes 
-                      (e.g. --key s:b0 or --key s:192.168.0.45 or --key s:01-02-03-04-05-06)
-                i     integer value 
-                      (e.g. --key i:1234 or --key i:-5)
-                b     boolean, possible values: true, false
-                      (e.g. --key b:true)
-
-      --flags c and d query parameters. CORECONF allows one c and one d query 
-              each. They are concatenated by ','. 
-              Possible values are:
-                c=c
-                c=n
-                c=a
-                d=a
-                d=t 
-
-
-  mup1ct [options] sysrq trace <TRACE-SPECIFIER>[,<TRACE-SPECIFIER>...]
-    This is used to set a trace level, where <TRACE-SPECIFIER> is defined as:
-      <MODULE>:<LEVEL>
-
-      Where:
-        <MODULE>: Is the name of a given module. An "empty string" may be used as an alias
-                  for all modules.
-        <LEVEL>:  Can be specified as one of: 'off', 'error', 'info', 'debug',
-                  'noise', 'get'.
-                  Here 'get' is special as it will trigger the given trace level
-                  to be printed as a MUP1-Trace message.
-                  All other will cause an update of the trace level.
-                  Default value is 'get'
-    If multiple trace-specifier are given, then they will be evaluated in
-    sequence.
-
-    Example:
-      mup1ct -t sysrq trace : # Print all trace levels
-      mup1ct -t sysrq trace :off # Disable all traces
-      mup1ct -t sysrq trace port:info # Set trace level in 'port' to info level
-
-  mup1ct [options] sysrq dump <DUMP-SPECIFIER>
-    This is used to show switch/PHY state, where <DUMP-SPECIFIER> is defined as:
-      <LAYER>:<GROUP>:<PORT-LIST>:<FLAGS>:<ACTION>
-
-      Where:
-        <LAYER>    : Layer, use 'ail' or 'cil' (default is both layers).
-        <GROUP>    : Group, use 'get' to see groups (default is all groups).
-        <PORT-LIST>: Port list, for example '0,2-5' (default is all ports).
-        <FLAGS>    : Flags, 'full' and 'clear' may be used.
-        <ACTION>   : Group specific action code
-
-    Examples (abbreviated layer/group/flags are used):
-      mup1ct sysrq dump           : Dump all switch state
-      mup1ct sysrq dump a:c       : Dump AIL switch counters for all ports
-      mup1ct sysrq dump c:c:1,3   : Dump CIL switch counters for port 1 and 3
-      mup1ct sysrq dump a:c:1:f   : Dump AIL detailed switch counters for port 1
-      mup1ct sysrq dump a:ac:::2  : Dump AIL ACL policers (action 2)
-
-  mup1ct [options] listen
-    This command will not issue any requests, but simply listen to the UART line
-    and if used in combination with '-t' then it shall print traces.
-    Notice the default "waiting" ('-w') time here is infinite.
-USAGE
-
-def sid_encode sid
-  base64_urlsafe = [
-    'A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P',
-    'Q','R','S','T','U','V','W','X','Y','Z','a','b','c','d','e','f',
-    'g','h','i','j','k','l','m','n','o','p','q','r','s','t','u','v',
-    'w','x','y','z','0','1','2','3','4','5','6','7','8','9','-','_']
-
-  buf = ""
-  save = false
-  i = 60
-  j = 0
-  n = 0
-  while i >= 0 do
-      n = (sid.to_i >> i) & 0x3f
-      if (n != 0)
-          save = true # Start saving after first non zero data
-      end
-      if (save)
-          buf = buf + base64_urlsafe[n]
-      end
-      i -= 6
-  end
-  return buf
-end
-
-
-COAP_CODE_PING = 0
-COAP_CODE_GET = 1
-COAP_CODE_POST = 2
-COAP_CODE_PUT = 3
-COAP_CODE_DEL = 4
-COAP_CODE_FETCH = 5
-COAP_CODE_IPATCH = 7
-
-COAP_FORMAT_UNSPECIFIED                =  -1
-COAP_FORMAT_TEXT_PLAIN                 =   0
-COAP_FORMAT_APPL_LINK                  =  40
-COAP_FORMAT_APPL_XML                   =  41
-COAP_FORMAT_APPL_JSON                  =  50
-COAP_FORMAT_APPL_CBOR                  =  60
-COAP_FORMAT_APPL_YANG_DATA_CBOR        = 140
-COAP_FORMAT_APPL_YANG_IDENTIFIERS_CBOR = 141
-COAP_FORMAT_APPL_YANG_INSTANCES_CBOR   = 142
-
-COAP_TYPE_CONFIRMABLE = 0
-COAP_TYPE_NON_CONFIRMABLE = 1
-COAP_TYPE_ACK = 2
-COAP_TYPE_RESET = 3
-
-COAP_OPT_IF_MATCH       =  1 # opaque (not implemented)
-COAP_OPT_URI_HOST       =  3 # string (not implemented)
-COAP_OPT_ETAG           =  4 # opaque (not implemented)
-COAP_OPT_IF_NONE_MATCH  =  5 # empty (not implemented)
-COAP_OPT_URI_PORT       =  7 # uint (not implemented)
-COAP_OPT_LOCATION_PATH  =  8 # string (not implemented)
-COAP_OPT_URI_PATH       = 11 # string
-COAP_OPT_CONTENT_FORMAT = 12 # uint
-COAP_OPT_MAX_AGE        = 14 # uint (not implemented)
-COAP_OPT_URI_QUERY      = 15 # string
-COAP_OPT_ACCEPT         = 17 # uint
-COAP_OPT_LOCATION_QUERY = 20 # string (not implemented)
-COAP_OPT_BLOCK2         = 23 # Block2
-COAP_OPT_BLOCK1         = 27 # Block1
-
-COAP_OPT_PROXY_URI      = 35 # string (not implemented)
-COAP_OPT_PROXY_SCHEME   = 39 # string (not implemented)
-COAP_OPT_SIZE1          = 60 # uint (not implemented)
+# Use libeasy constants
+Coap = Et::Frame::Coap
 
 COAP_ACK_WAIT_TIME = 1       # Wait for ACK in one second then retransmit
 COAP_LAST_ACK_WAIT_TIME = 5  # Wait for the last ACK
 
-SYM_SOF = 0x3e
-SYM_EOF = 0x3c
-SYM_ESC = 0x5c
-SYM_NL  = 0x0d
-SYM_00  = 0x30
-SYM_FF  = 0x46
-
-if ARGV.size == 0
-    puts "No command specified!"
-    puts
-    puts USAGE
-    exit 0
-end
-
-$opt = {}
-$cc_opt = {:keys => [], :flags => [], :datastore => "c"}
-
-OptionParser.new do |opts|
-    opts.banner = "Usage: #{$0}"
-
-    opts.on("-h", "--help", "The MUP1CT help") do |h|
-        $opt[:help] = h
-    end
-
-    opts.on("-d", "--device <URL>", "The device terminal URL") do |d|
-        $opt[:device] = d
-    end
-
-    opts.on("-i", "--input <FILE>", "Read data from <FILE>") do |i|
-        $opt[:input] = i
-    end
-
-    opts.on("-k", "--key <KEY_FILE.pem>", "Read pem formatted key from <KEY_FILE.pem>") do |k|
-        $opt[:pem_key] = k
-    end
-
-    opts.on("-o", "--output <FILE>", "Write output to <FILE>") do |o|
-        $opt[:output] = o
-    end
-
-    opts.on("-w", "--wait <VAL>", "Response wait time") do |w|
-        $opt[:wait] = w
-    end
-
-    opts.on("-t", "--trace", "Print all trace") do |t|
-        $opt[:trace] = t
-    end
-
-    opts.on("-T", "--Trace <WAIT-TIME>", "Print trace in a specific time") do |tw|
-        $opt[:Trace] = tw
-    end
-
-    opts.on("--ds <DS>", "Datastore to be accessed" ) do |ds|
-        $cc_opt[:datastore] = ds   
-    end
-
-    opts.on("--sid <SID>", "SID to be adressed" ) do |a|
-        $cc_opt[:sid] = a
-    end
-
-    opts.on("--content-type <NUM>", "Content type of payload" ) do |ct|
-        $cc_opt[:content_type] = ct.to_i
-    end
-
-    opts.on("--accept <NUM>", "Expected content type of response" ) do |ct|
-        $cc_opt[:accept] = ct.to_i
-    end
-
-    opts.on("--keys <KEY>", "Instance identifier keys" ) do |k|
-        $cc_opt[:keys] = k.split(",")   
-    end
-
-    opts.on("--flags <FLAG>", "c and d queries" ) do |f|
-        $cc_opt[:flags] = f.split(",")   
-    end
-
-end.parse!
-
-if !$opt[:help].nil?
-  puts "#{USAGE}"
-  exit 0
-end
-
-if $opt[:device].nil?
-  if (File.exist?('.mscc-libeasy-topology.yaml'))
-      conf = YAML.load_file ".mscc-libeasy-topology.yaml"
-  else
-      conf = YAML.load_file "#{ENV["HOME"]}/.mscc-libeasy-topology.yaml"
+# SID to base64url encoding for CORECONF URIs
+def sid_encode(sid)
+  base64_urlsafe = ('A'..'Z').to_a + ('a'..'z').to_a + ('0'..'9').to_a + ['-', '_']
+  buf = ""
+  save = false
+  60.step(0, -6) do |i|
+    n = (sid.to_i >> i) & 0x3f
+    save = true if n != 0
+    buf += base64_urlsafe[n] if save
   end
-  $device = conf["dut"]["terminal"]
-else
-  $device = $opt[:device]
+  buf
 end
 
-commands = ["cc", "coap", "coaps", "sysrq", "listen", "ping"]
-$cmd = ARGV.shift
-if !commands.include?($cmd)
-    puts "command is invalid"
-    exit -1
-end
-
-$input = nil
-if !$opt[:input].nil?
-    if !File.exist?($opt[:input])
-        puts "File does not exist"
-        exit -1
-    end
-    file = File.open($opt[:input])
-    file.binmode
-    $input = file.read
-    file.close
-end
-
-$stdin.binmode
-$stdout.binmode
-$dtls_enable = false
-
-if ($cmd == "coaps")
-    $dtls_enable = true
-    $cmd = "coap"
-end
-
-if ($cmd == "coap")
-    $coap_method = ARGV.shift
-    if !["get", "put", "post", "del"].include?($coap_method)
-        puts "coap method invalid"
-        exit -1
-    end
-    if (ARGV.size == 0)
-        puts "The coap URL is missing"
-        exit -1
-    end
-    coap_url = ARGV.shift
-    coap_url_split = coap_url.split('?')
-    if (!coap_url_split[0].nil?)
-        $coap_url_paths = coap_url_split[0].split('/')
-    end
-    if (!coap_url_split[1].nil?)
-        $coap_url_keys = coap_url_split[1].split('&')
-    end
-    if !$input.nil?
-        $coap_payload = $input
-    else if !STDIN.tty?
-        $coap_payload = STDIN.read
-    else if (ARGV.size != 0)
-        $coap_payload = ARGV.shift
-    end
-    end
-    end
-end
-
-if ($cmd == "cc")
-  $cc_method = ARGV.shift
-  if !["get", "put", "post", "del", "fetch", "ipatch"].include?($cc_method)
-    puts "cc method invalid"
-    exit -1
+# Tracer class to control debug output (send to STDERR, not STDOUT)
+class Tracer
+  def initialize(level = :silent)
+    @level = level
   end
 
-  # TODO
-  if (ARGV.size == 0)
-    #puts "The cc arguments are missing"
-    #exit -1
-  end
-  # read the rest of ARGV
+  def t(mod, level, msg)
+    return if @level == :silent
 
-  # A missing SID indicates a datastore operation
-  if !$cc_opt[:sid].nil?
-    if !["get", "put", "post", "del"].include?($cc_method)
-      puts ("Option --sid is not valid in #{$cc_method} command.")
-      exit -1
+    case level
+    when :fatal
+      STDERR.puts "FATAL: #{mod}: #{msg}" if [:fatal, :error, :info, :debug].include?(@level)
+    when :err
+      STDERR.puts "#{mod} #{msg}" if [:error, :info, :debug].include?(@level)
+    when :info
+      # Suppress info level by default
+    when :debug
+      STDERR.puts "DEBUG: #{mod}: #{msg}" if [:debug].include?(@level)
     end
-    # SID: number or symbolic name?
-    s = $cc_opt[:sid]
-    if (s =~ /\b\d/) != nil
-      $stderr.puts "MUP1CT SID num #{s}"
-    elsif (s =~ /\b[a-zA-Z\/][a-zA-Z\/:-]*/) != nil
-      $stderr.puts "MUP1CT SID name #{s}"
-      doc = File.open("../docs/sids.xml") { |f| Nokogiri::XML(f) }
-      n = doc.xpath("/yang-objs/obj[@full_path=\"#{s}\"]/@sid").first
-      if n != nil
-        n = n.value
-        $cc_opt[:sid] = n
-      else
-        puts ("SID not found.")
-        exit -1
-      end
-    elsif
-      puts "invalid SID"
-      exit -1
-    end
-    $stderr.puts "MUP1CT SID #{$cc_opt[:sid]} -> #{sid_encode($cc_opt[:sid])}"
-  end
-
-  # key queries 
-  $keys_diag = []
-  if (!$cc_opt[:keys].empty?)
-    if !["get", "put", "post", "del"].include?($cc_method)
-      puts ("Option --keys is not valid in #{$cc_method} command.")
-      exit -1
-    end
-    $cc_opt[:keys].each do |key|
-      key.strip!
-      case key
-      when /^(s):(.+)/
-        $keys_diag << "\"#{Shellwords.escape(%Q[#{$2}])}\""
-      when /^(i):([+-]?[0-9]+)/
-        $keys_diag << $2.to_i
-      when /^(b):(true|false)/
-        $keys_diag << $2
-      else 
-        puts "Wrong instance identifier key #{key}"
-        exit -1
-      end
-    end
-  end
-
-  # flags array[2], check for double 
-  $flags_diag = []
-  c_exist = false
-  d_exist = false
-  if (!$cc_opt[:flags].empty?)
-    if !["get", "fetch"].include?($cc_method)
-      puts ("Option --flags not valid in #{$cc_method} command.")
-      exit -1
-    end
-    $cc_opt[:flags].each do |flag| 
-      $stderr.puts "MUP1CT flags #{flag}"
-      case flag
-      when /c=[c,n,a]/
-        if (c_exist == true)
-          puts "double c query"
-          exit -1
-        end
-        c_exist = true
-        $flags_diag << flag
-      when /d=[a,t]/
-        if (d_exist == true)
-          puts "double d query"
-          exit -1
-        end
-        d_exist = true
-        $flags_diag << flag
-      else
-        puts "Wrong c and/or d query"
-        exit -1
-      end
-    end
-  end
-
-  if !$input.nil?
-    $coap_payload = $input
-  else if !STDIN.tty?
-    $coap_payload = STDIN.read
-  else if (ARGV.size != 0)
-    $coap_payload = ARGV.shift
-  end
-  end
-  end
-
-end 
-
-$output_file = nil
-if !$opt[:output].nil?
-    #puts "--output Not supported"
-    $output_file = File.open($opt[:output], "w")
-end
-
-if !$opt[:trace].nil? && !$opt[:Trace].nil?
-    puts "Both -t and -T cannot be specified"
-    exit -1
-end
-
-coap_op = ($cmd == "coap" || $cmd == "cc")
-if ($cmd == "listen")
-    $response_wait = -1
-else
-if (coap_op)
-    $response_wait = (3 * COAP_ACK_WAIT_TIME)
-else
-    $response_wait = 1
-end
-end
-
-if !$opt[:wait].nil?
-    # Wait option overwrite default
-    if ($opt[:wait].to_i > $response_wait)
-        # The response wait time can only be increased
-        $response_wait = $opt[:wait].to_i
-    end
-end
-$responce_wait_forever = ($response_wait.to_i < 0) ? true : false
-$response_wait = $response_wait.to_i.abs()
-
-$trace_wait = 0
-$trace = false
-$trace_restart = false
-if !$opt[:trace].nil?
-    $trace = true
-end
-if !$opt[:Trace].nil?
-    $trace = true
-    $trace_restart = ($opt[:Trace].to_i < 0) ? true : false
-    $trace_wait = $opt[:Trace].to_i.abs()
-end
-
-if ($cmd == "sysrq")
-    case ARGV.shift
-    when "trace"
-        if (ARGV.size != 0)
-            $sys_trace_args = ARGV.shift
-            $sys_trace = true
-        end
-    when "dump"
-        $sys_dump_args = (ARGV.size == 0 ? "" : ARGV.shift)
-        $sys_dump = true
-        $trace = true
-    else
-    end
-end
-
-$blok1_size = 256
-$blok2_size = 256
-$pl_split = []
-
-#puts "$responce_wait_forever #{$responce_wait_forever}  $response_wait #{$response_wait}"
-#puts "$trace_restart #{$trace_restart}  $trace_wait #{$trace_wait}"
-#puts "Parse of parameters done"
-
-def cpap_opt_val_enc v
-  if v < 13
-    return v, ""
-  elsif v <= 268
-    v -= 13
-    return 13, [v].pack("C")
-  elsif v < 65536
-    v -= 269
-    return 14, [v].pack("n")
-  else
-    raise "Invalid value"
   end
 end
 
-def coap_opt_uint_enc v
-  if v == 0
-    return ""
-  elsif v < 256
-    [v].pack("C")
-  elsif v < 65536
-    [v].pack("n")
-  elsif v < 16777216
-    [v].pack("N")[1..3]
-  else
-    [v].pack("N")
-  end
-end
-
-def coap_opt_uint_dec v
-  case v.size
-  when 0
-    v.unshift(0, 0, 0, 0)
-  when 1
-    v.unshift(0, 0, 0)
-  when 2
-    v.unshift(0, 0)
-  when 3
-    v.unshift(0)
-  when 4
-    # do nothing
-  else
-    raise "unexpected size"
-  end
-
-  return v.pack("C*").unpack("N").first
-end
-
-def coap_opt_block_enc num, m, block_size
-  szx = 0
-  case block_size
-  when 16
-    szx = 0
-  when 32
-    szx = 1
-  when 64
-    szx = 2
-  when 128
-    szx = 3
-  when 256
-    szx = 4
-  when 512
-    szx = 5
-  when 1024
-    szx = 6
-  else
-    raise "invalid block size"
-  end
-
-  val = szx
-  if m != 0
-    val += 8
-  end
-
-  val += (num << 4)
-
-  return coap_opt_uint_enc val
-end
-
-def coap_opt_block_dec arr
-  val = coap_opt_uint_dec(arr)
-  szx = val & 0x7
-  val >>= 3
-  m = val & 1
-  val >>= 1
-  return val, m, 2**(szx + 4)
-end
-
-class CoAPOPTHDR < BitStruct
-  unsigned    :coap_opt_delta,   4,     "Option Delta Value"
-  unsigned    :coap_opt_length,  4,     "Option Length"
-  rest        :body,                    "Body of message"
-end
-
-def coap_opt_enc delta, payload
-
-  h = CoAPOPTHDR.new
-  d, d_ext = cpap_opt_val_enc(delta)
-  pl, pl_ext = cpap_opt_val_enc(payload.size)
-
-  h.coap_opt_delta = d
-  h.coap_opt_length = pl
-  h << d_ext
-  h << pl_ext
-  h << payload
-  h
-end
-
-def coap_default_accept method
-  case method
-  when COAP_CODE_GET
-      COAP_FORMAT_APPL_YANG_DATA_CBOR
-  when COAP_CODE_FETCH
-      COAP_FORMAT_APPL_YANG_INSTANCES_CBOR
-  when COAP_CODE_POST
-      # TODO: Change to COAP_FORMAT_APPL_YANG_INSTANCES_CBOR when POST has been updated to core-comi-17
-      COAP_FORMAT_UNSPECIFIED
-  else
-      COAP_FORMAT_UNSPECIFIED
-  end
-end
-
-def coap_default_content_format method
-  case method
-  when COAP_CODE_POST
-      # TODO: Change to COAP_FORMAT_APPL_YANG_INSTANCES_CBOR when POST has been updated to core-comi-17
-      COAP_FORMAT_APPL_YANG_DATA_CBOR
-  when COAP_CODE_PUT
-      COAP_FORMAT_APPL_YANG_DATA_CBOR
-  when COAP_CODE_FETCH
-      COAP_FORMAT_APPL_YANG_IDENTIFIERS_CBOR
-  when COAP_CODE_IPATCH
-      COAP_FORMAT_APPL_YANG_INSTANCES_CBOR
-  else
-      COAP_FORMAT_UNSPECIFIED
-  end
-end
-
-class CoAPHDR < BitStruct
-  unsigned    :coap_ver,   2,     "Version"
-  unsigned    :coap_t,     2,     "Type"
-  unsigned    :coap_tkl,   4,     "Token Length"
-  unsigned    :coap_code,  8,     "Code"
-  unsigned    :coap_msgid, 16,    "Message ID"
-  rest        :body,              "Body of message"
-
-  note "Body contains optional token, options, 0xF delimitor and payload"
-
-  initial_value.coap_ver = 1
-  initial_value.coap_tkl = 0
-end
-
-class CoapFrame
-  attr_accessor :type, :code_class, :code_detail, :payload, :msgid, :token
-  attr_accessor :uri_paths
-  attr_accessor :uri_keys
-  attr_accessor :content_type
-  attr_accessor :accept
-
-  attr_accessor :block1_block_size
-  attr_accessor :block1_more
-  attr_accessor :block1_num
-
-  attr_accessor :block2_block_size
-  attr_accessor :block2_more
-  attr_accessor :block2_num
-
-
-  def initialize data = nil
-    if data
-      h = CoAPHDR.new data
-      raise "Unexpected version: #{h.coap_ver}" if h.coap_ver != 1
-
-      @type = h.coap_t
-      @code_class = h.coap_code >> 5
-      @code_detail = h.coap_code & 0x1F
-      @msgid = h.coap_msgid
-      data = h.body.unpack("C*")
-
-      if h.coap_tkl > 0
-        if data.size < h.coap_tkl
-          raise "Token not present in data"
-        end
-        @token = data.shift(h.coap_tkl).pack("C*")
-      end
-
-      return if data.size == 0
-
-      # pop options while present
-      opt_number = 0
-      while data.size > 0 && data[0] != 255
-        opthdr = CoAPOPTHDR.new(data.shift(1).pack("C"))
-        option_size = 0
-        opt_delta = 0
-        if opthdr.coap_opt_delta == 13
-          raise "underflow in option" if data.size < 1
-          opt_delta = data.shift(1)[0] + 13
-
-        elsif opthdr.coap_opt_delta == 14
-          raise "underflow in option" if data.size < 2
-          opt_delta = data.shift(2).pack("C*").unpack("n") + 269
-
-        elsif opthdr.coap_opt_delta == 15
-          raise "Reserved option delta!"
-        else
-          opt_delta = opthdr.coap_opt_delta
-        end
-
-        val_size = 0
-        if opthdr.coap_opt_length == 13
-          raise "underflow in option" if data.size < 1
-          val_size = data.shift(1)[0] + 13
-
-        elsif opthdr.coap_opt_length == 14
-          raise "underflow in option" if data.size < 2
-          val_size = data.shift(2).pack("C*").unpack("n") + 269
-
-        elsif opthdr.coap_opt_length == 15
-          raise "Reserved option delta!"
-        else
-          val_size = opthdr.coap_opt_length
-        end
-
-        raise "underflow option value" if data.size < val_size
-
-        opt_number += opt_delta
-
-        case opt_number
-        when COAP_OPT_URI_PATH
-          @uri_paths = data.shift(val_size).pack("c*")
-        when COAP_OPT_CONTENT_FORMAT
-          @content_type = coap_opt_uint_dec(data.shift(val_size))
-        when COAP_OPT_URI_QUERY
-          @uri_keys = data.shift(val_size).pack("c*")
-        when COAP_OPT_ACCEPT
-          @accept = coap_opt_uint_dec(data.shift(val_size))
-        when COAP_OPT_BLOCK1
-          @block1_num, @block1_more, @block1_block_size = coap_opt_block_dec(data.shift(val_size))
-        when COAP_OPT_BLOCK2
-          @block2_num, @block2_more, @block2_block_size = coap_opt_block_dec(data.shift(val_size))
-        else
-          #STDERR.puts "Skipping option #{opt_number}"
-          data.shift(val_size)
-        end
-      end
-
-      return if data.size == 0
-
-      delim = data.shift(1).first
-      raise "Unexpected delimitor #{delim}" if delim != 255
-      @payload = data.pack("c*")
-    end
-  end
-
-  def to_s
-    s = []
-    s << "type: #{@type}" if @type
-    s << "code_class: #{@code_class}" if @code_class
-    s << "code_detail: #{@code_detail}" if @code_detail
-    s << "payload-length: #{@payload.size}" if @payload
-    s << "msgid: #{@msgid}" if @msgid
-    if @uri_paths
-        s << "uri_path: "
-        @uri_paths.each { |path|
-            s << " #{path}"
-        }
-    end
-    if @uri_keys
-        s << "uri_key: "
-        @uri_keys.each { |key|
-            s << " #{key}"
-        }
-    end
-    s << "content_type: #{@content_type}" if @content_type
-    s << "accept: #{@accept}" if @accept
-    s << "block1_block_size: #{@block1_block_size}" if @block1_block_size
-    s << "block1_more: #{@block1_more}" if @block1_more
-    s << "block1_num: #{@block1_num}" if @block1_num
-    s << "block2_block_size: #{@block2_block_size}" if @block2_block_size
-    s << "block2_more: #{@block2_more}" if @block2_more
-    s << "block2_num: #{@block2_num}" if @block2_num
-    return s.join(" ")
-  end
-
-  def opt_delta val_last, val_cur
-    raise "Wrong option order" if val_cur < val_last
-    v = val_cur - val_last
-    return val_cur, v
-  end
-
-  def enc
-    h = CoAPHDR.new
-    h.coap_t = @type
-    h.coap_code = (@code_class << 5) | (@code_detail)
-    h.coap_msgid = @msgid
-    h.coap_tkl = @token.size if @token
-
-    opt_last = 0
-    if @uri_paths
-      @uri_paths.each { |opt|
-        if opt.length > 0
-          opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_URI_PATH)
-          h << coap_opt_enc(opt_delta, opt)
-        end
-      }
-    end
-
-    if @content_type
-      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_CONTENT_FORMAT)
-      h << coap_opt_enc(opt_delta, coap_opt_uint_enc(@content_type))
-    end
-
-    if @uri_keys
-      @uri_keys.each { |opt|
-        if opt.length > 0
-          opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_URI_QUERY)
-          h << coap_opt_enc(opt_delta, opt)
-        end
-      }
-    end
-
-    if @accept
-      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_ACCEPT)
-      h << coap_opt_enc(opt_delta, coap_opt_uint_enc(@accept))
-    end
-
-    if @block2_block_size and @block2_more and @block2_num
-      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_BLOCK2)
-      h << coap_opt_enc(opt_delta, coap_opt_block_enc(@block2_num, @block2_more, @block2_block_size))
-    end
-
-    if @block1_block_size and @block1_more and @block1_num
-      opt_last, opt_delta = opt_delta(opt_last, COAP_OPT_BLOCK1)
-      h << coap_opt_enc(opt_delta, coap_opt_block_enc(@block1_num, @block1_more, @block1_block_size))
-    end
-
-    if @payload && (@payload !="")
-      h << [255].pack("C")
-      h << @payload
-    end
-
-    return h
-  end
-
-end
-
-def coap_frame_build type, code, msgid, paths = nil, keys = nil, payload = nil
-  f = CoapFrame.new
-  if payload
-      content_type = $cc_opt.fetch(:content_type, coap_default_content_format(code))
-      f.content_type = content_type if content_type > COAP_FORMAT_UNSPECIFIED
-    f.payload = payload
-  end
-  accept = $cc_opt.fetch(:accept, coap_default_accept(code))
-  f.accept = accept if accept > COAP_FORMAT_UNSPECIFIED
-  f.type = type
-  f.code_class = 0
-  f.code_detail = code
-  f.msgid = msgid
-  f.uri_paths = paths
-  f.uri_keys = keys
-  f.block2_block_size = $blok2_size
-  f.block2_more = 0
-  f.block2_num = 0
-  return f
-end
-
-class SYSREQ < BitStruct
-  unsigned    :cmd,   8,     "Sys request command"
-  rest        :body,         "Body of sys request"
-end
-
-class MUP1
-  attr_accessor :timeout
-
-  def initialize scheme, stream
-        @dbg = []
-    @state = :init
-    @mup1_rx_queue = []
-    @scheme = scheme
-    @timeout = 5
-    @stream = stream
-  end
-
-  def poll_input timeout = nil
-    timeout = @timeout if not timeout
-    rs = IO.select([@stream], [], [], timeout)
-    return if rs.nil?
-    if rs[0][0]
-      rs[0][0].read_nonblock(512).unpack("C*").each do |c|
-        mup1_rx_sm c
-      end
-    end
-  end
-
-  def mup1_rx_sm c
-    case @state
-    when :init
-      if c == SYM_SOF
-        @state = :sof
-        @mup1_data = []
-        @mup1_data_chk = [SYM_SOF]
-        @mup1_chk = []
-        @mup1_type = 0
-      end
-
-    when :sof
-      @mup1_type = c
-      @state = :data
-      @mup1_data_chk << c
-
-    when :data
-      if @mup1_data.size > 1024
-        $stderr.puts "Frame too big!"
-        @state = :init
-      else
-        case c
-        when SYM_ESC
-          @state = :esc
-
-        when SYM_EOF
-          @mup1_data_chk += @mup1_data
-          @mup1_data_chk << SYM_EOF
-
-          if @mup1_data.size % 2 != 0
-            # We have an odd sized header, meaning that even sized message shall
-            # lead to single EOF
-            @state = :chk0
-          else
-            # We have an odd sized header, meaning that odd sized message shall
-            # lead to two EOF
-            @state = :eof2
-            @mup1_data_chk << SYM_EOF
-          end
-
-        when SYM_SOF, 0, 0xff
-          $stderr.puts "invalid data element: '#{c}'"
-          @state = :init
-
-        else
-          @mup1_data << c
-        end
-      end
-
-    when :esc
-      @state = :data
-      case c
-      when SYM_SOF, SYM_ESC, SYM_EOF
-        @mup1_data << c
-      when SYM_00
-        @mup1_data << 0x00
-      when SYM_FF
-        @mup1_data << 0xFF
-      else
-        $stderr.puts "invalid escape sequence: '#{c}'"
-        @state = :init
-      end
-
-    when :eof2
-      if c == SYM_EOF
-        @state = :chk0
-      else
-        $stderr.puts "Expected repeated esc, got #{c} / #{"%c"%c}"
-        @state = :init
-      end
-
-    when :chk0
-      @mup1_chk << c
-      @state = :chk1
-
-    when :chk1
-      @mup1_chk << c
-      @state = :chk2
-
-    when :chk2
-      @mup1_chk << c
-      @state = :chk3
-
-    when :chk3
-      @mup1_chk << c
-      @state = :init
-
-      chk = checksum_calc(@mup1_data_chk).unpack("C*")
-      if chk != @mup1_chk
-        STDERR.puts "MUP1 Checksum error!"
-      else
-        @mup1_rx_queue << {:type => @mup1_type, :data => @mup1_data}
-      end
-    end
-  end
-
-  def mup1_frame_get timeout_ = nil
-    if @mup1_rx_queue.size == 0
-      poll_input timeout_
-    end
-
-    frame = @mup1_rx_queue.shift
-    return nil if not frame
-
-    return [frame[:type]].pack("C"), frame[:data].pack("C*")
-  end
-
-  def mup1_frame_inj type, data = ""
-    # Build the frame un-escaped to calculate checksum
-    frame_a = [SYM_SOF, type.ord] + data.unpack("C*") + [SYM_EOF]
-    frame_a << SYM_EOF if data.size % 2 == 0
-    cs = checksum_calc frame_a
-
-    # Build the frame escaped to be injected
-    frame = ">"
-    frame << type
-    if !data.nil?
-      data_array = data.unpack("C*")
-      escaped_data_array = Array.new
-      data_array.each { |byte|
-        if ((byte == SYM_SOF) || (byte == SYM_EOF) || (byte == SYM_ESC) ||
-            (byte == 0x00) || (byte == 0xFF))
-          escaped_data_array << SYM_ESC #Insert escape character '\'
-        end
-        if (byte == 0x00)
-            byte = SYM_00
-        end
-        if (byte == 0xFF)
-            byte = SYM_FF
-        end
-        escaped_data_array << byte
-      }
-      frame << escaped_data_array.pack("c*")
-    end
-    frame << "<"
-    if (data.nil? || ((data.size % 2) == 0))
-      frame << "<"
-    end
-    frame << cs
-
-    write frame
-  end
-
-  def write s
-    #STDERR.puts s
-    @stream.write s
-    @stream.flush
-  end
-
-  def checksum_calc data
-    sum = data.pack("C*").unpack("n*").sum
-
-    # Add carry twice (the first addition may cause another, e.g. 0x1ffff)
-    sum = ((sum >> 16) + (sum & 0xffff))
-    sum = ((sum >> 16) + (sum & 0xffff))
-
-    sum = ~sum
-    sum = sum & 0xFFFF
-
-    #Convert checksum to ascii string
-    ascii = "%.4x" %sum
-
-    return ascii
-  end
-end # MUP1
-
+# Console handler - receives MUP1 non-protocol data and announces
 class Mup1Con < Et::Handler::Base
   def initialize lower_layer
     super "CON"
     lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_NON_MUP1, self
-    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_TRACE, self
     lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_ANNOUNCE, self
   end
 
@@ -1180,539 +127,776 @@ class Mup1Con < Et::Handler::Base
     when Et::Handler::Mup1::MUP1_CB_NON_MUP1
       data.strip!
       puts "CON: #{data.inspect}" if data.size > 0
-    when Et::Handler::Mup1::MUP1_CB_TRACE
-      puts "TRACE: #{data.inspect}"
     when Et::Handler::Mup1::MUP1_CB_ANNOUNCE
       puts "ANNOUNCE: #{data.inspect}"
     end
   end
 end
 
-class Dtls_Wrapper
-  class Mup1_Wrapper < Et::Handler::Base
-    def initialize mup1
-      super("MUP1", nil, nil)
-      @mup1 = mup1
-    end
-    def tx type, data = ""
-      @mup1.mup1_frame_inj type, data
-    end
-    def poll
-      timeout = 0.2
-      type , frame = @mup1.mup1_frame_get timeout
-      while (!type.nil?)
-        if type
-          type = type.unpack("C*")[0]
+# Ping handler - receives ping responses
+class PingHandler < Et::Handler::Base
+  attr_reader :pong_received, :pong_data
+
+  def initialize lower_layer
+    super "PING"
+    @pong_received = false
+    @pong_data = nil
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_PING, self
+  end
+
+  def rx type, data
+    @pong_received = true
+    @pong_data = data
+  end
+end
+
+# Trace handler for -t/-T options
+class TraceHandler < Et::Handler::Base
+  attr_accessor :trace_enabled
+
+  def initialize lower_layer
+    super "TRACE"
+    @trace_enabled = false
+    lower_layer.handler_reg Et::Handler::Mup1::MUP1_CB_TRACE, self
+  end
+
+  def rx type, data
+    STDERR.print data if @trace_enabled
+  end
+end
+
+# CoAP client wrapper for libeasy CoAP handler
+class CoapClient
+  attr_reader :payload_rx, :code_class, :code_detail
+
+  def initialize mup1_handler, tracer = nil, dtls_enable = false, pem_key = nil
+    @mup1 = mup1_handler
+    @tracer = tracer
+    @dtls_enable = dtls_enable
+
+    if dtls_enable
+      if pem_key.nil?
+        key_file_name = "client_key.pem"
+        if File.exist?(key_file_name)
+          pem_key = File.read(key_file_name)
+        else
+          pem_key = pem_ec_key_gen
+          File.write(key_file_name, pem_key)
         end
-        handler_call_rx type, frame
-        
-        type , frame = @mup1.mup1_frame_get timeout
+      end
+      config = Et::Handler::Dtls_Config.new(pem_key)
+      @dtls = Create_Dtls_Handlers(config, mup1_handler, tracer)
+      @coap = Et::Handler::Coap.new(@dtls, tracer)
+    else
+      @coap = Et::Handler::Coap.new(mup1_handler, tracer)
+    end
+  end
+
+  def request(method, uri, payload = nil, opts = {})
+    res = @coap.req(method, uri, payload, opts)
+    @payload_rx = res.payload_rx if res
+    @code_class = res.code_class if res
+    @code_detail = res.code_detail if res
+    return res
+  end
+
+  def get(uri, opts = {})
+    request(Coap::CODE_GET, uri, nil, opts)
+  end
+
+  def put(uri, payload, opts = {})
+    request(Coap::CODE_PUT, uri, payload, opts)
+  end
+
+  def del(uri, opts = {})
+    request(Coap::CODE_DEL, uri, nil, opts)
+  end
+
+  def post(uri, payload, opts = {})
+    request(Coap::CODE_POST, uri, payload, opts)
+  end
+
+  def fetch(uri, payload, opts = {})
+    request(Coap::CODE_FETCH, uri, payload, opts)
+  end
+
+  def ipatch(uri, payload, opts = {})
+    request(Coap::CODE_IPATCH, uri, payload, opts)
+  end
+end
+
+# CoAP response code text lookups
+SUCCESS_CODES = {1=>"Created", 2=>"Deleted", 3=>"Valid", 4=>"Changed", 5=>"Content"}
+CLIENT_ERROR_CODES = {0=>"Bad Request", 1=>"Unauthorized", 2=>"Bad Option", 3=>"Forbidden",
+                      4=>"Not Found", 5=>"Method Not Allowed", 6=>"Not Acceptable",
+                      8=>"Request Entity Incomplete", 9=>"Conflict", 12=>"Precondition Failed",
+                      13=>"Request Entity Too Large", 15=>"Unsupported Content-Format"}
+SERVER_ERROR_CODES = {0=>"Internal Server Error", 1=>"Not Implemented", 2=>"Bad Gateway",
+                      3=>"Service Unavailable", 4=>"Gateway Timeout", 5=>"Proxying Not Supported"}
+
+def success_detail(d) = SUCCESS_CODES[d.to_i] || "Unknown"
+def c_error_detail(d) = CLIENT_ERROR_CODES[d.to_i] || "Unknown"
+def s_error_detail(d) = SERVER_ERROR_CODES[d.to_i] || "Unknown"
+
+def print_response_code(code_class, code_detail)
+  if code_class == 2
+    STDERR.puts "RESPONSE-CODE: class 2 detail #{code_detail} Success #{success_detail(code_detail)}"
+  elsif code_class == 4
+    STDERR.puts "RESPONSE-CODE: class 4 detail #{code_detail} Client Error #{c_error_detail(code_detail)}"
+  elsif code_class == 5
+    STDERR.puts "RESPONSE-CODE: class 5 detail #{code_detail} Server Error #{s_error_detail(code_detail)}"
+  end
+end
+
+# Base class for all commands
+class Command
+  attr_reader :context
+
+  def initialize(context)
+    @context = context
+  end
+
+  def parse_args(argv)
+    # Override in subclasses
+  end
+
+  def execute
+    raise NotImplementedError, "Subclass must implement execute"
+  end
+
+  def response_wait
+    context[:wait] || 1
+  end
+
+  def poll_until(timeout_sec, forever: false)
+    timeout_end = Time.now + timeout_sec
+    while forever || Time.now < timeout_end
+      context[:dut].timeout_abs_set(Time.now + 0.1)
+      context[:dut].poll
+      yield if block_given?
+    end
+  end
+
+  def write_output(data)
+    if context[:output_file]
+      context[:output_file].write(data)
+      context[:output_file].close
+    else
+      print data
+    end
+  end
+end
+
+# Ping command
+class PingCommand < Command
+  def response_wait
+    context[:wait] || 1
+  end
+
+  def execute
+    start_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    ping_handler = context[:ping_handler]
+    mup1 = context[:mup1]
+    forever = context[:wait_forever]
+
+    mup1.tx("p", "")
+
+    timeout_end = Time.now + response_wait
+    while !ping_handler.pong_received && (Time.now < timeout_end || forever)
+      context[:dut].timeout_abs_set(Time.now + 0.1)
+      context[:dut].poll
+    end
+
+    if ping_handler.pong_received
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start_time
+      mup1_data_elements = ping_handler.pong_data.split(' ')
+      STDERR.puts "Pong received in #{(elapsed * 1000).truncate(2)} ms"
+      STDERR.puts "Build #{mup1_data_elements[0]}"
+      STDERR.puts "Up Time #{mup1_data_elements[1]}"
+      STDERR.puts "Data size #{mup1_data_elements[2]}" if mup1_data_elements[2]
+      STDERR.puts "Version #{mup1_data_elements[3]}" if mup1_data_elements[3]
+    else
+      STDERR.puts "No PONG frame received"
+    end
+  end
+end
+
+# CoAP command (coap/coaps)
+class CoapCommand < Command
+  attr_accessor :method, :url, :payload, :dtls_enable
+
+  def parse_args(argv)
+    @method = argv.shift
+    if !["get", "put", "post", "del", "ipatch", "fetch"].include?(@method)
+      puts "coap method invalid"
+      exit(-1)
+    end
+
+    if argv.empty?
+      puts "The coap URL is missing"
+      exit(-1)
+    end
+    @url = argv.shift
+
+    @payload = read_payload(argv)
+  end
+
+  def response_wait
+    context[:wait] || 3 * COAP_ACK_WAIT_TIME
+  end
+
+  def execute
+    opts = {}
+    opts[:content_type] = context[:content_type] if context[:content_type]
+    opts[:accept] = context[:accept] if context[:accept]
+
+    pem_key = context[:pem_key] ? File.read(context[:pem_key]) : nil
+    coap_client = CoapClient.new(context[:mup1], context[:tracer], @dtls_enable, pem_key)
+
+    case @method
+    when "get"
+      res = coap_client.get(@url, opts)
+    when "put"
+      res = coap_client.put(@url, @payload, opts)
+    when "del"
+      res = coap_client.del(@url, opts)
+    when "post"
+      res = coap_client.post(@url, @payload, opts)
+    when "ipatch"
+      res = coap_client.ipatch(@url, @payload, opts)
+    when "fetch"
+      res = coap_client.fetch(@url, @payload, opts)
+    end
+
+    handle_response(res)
+  end
+
+  private
+
+  def read_payload(argv)
+    if context[:input]
+      context[:input]
+    elsif !STDIN.tty?
+      STDIN.read
+    elsif !argv.empty?
+      argv.shift
+    end
+  end
+
+  def handle_response(res)
+    if res
+      print_response_code(res.code_class, res.code_detail)
+      if res.payload_rx && !res.payload_rx.empty?
+        write_output(res.payload_rx)
+      end
+    else
+      STDERR.puts "No COAP response frame received"
+    end
+  end
+end
+
+# CC (CORECONF) command
+class CcCommand < Command
+  attr_accessor :method, :payload
+  attr_accessor :datastore, :sid, :keys, :flags
+
+  def initialize(context)
+    super
+    @datastore = "c"
+    @keys = []
+    @flags = []
+  end
+
+  def parse_args(argv)
+    @method = argv.shift
+    if !["get", "put", "post", "del", "fetch", "ipatch"].include?(@method)
+      puts "cc method invalid"
+      exit(-1)
+    end
+
+    parse_sid
+    parse_keys
+    parse_flags
+    @payload = read_payload(argv)
+  end
+
+  def response_wait
+    context[:wait] || 3 * COAP_ACK_WAIT_TIME
+  end
+
+  def execute
+    uri = build_uri
+    opts = {}
+    opts[:content_type] = context[:content_type] if context[:content_type]
+    opts[:accept] = context[:accept] if context[:accept]
+
+    coap_client = CoapClient.new(context[:mup1], context[:tracer], false, nil)
+
+    case @method
+    when "get"
+      res = coap_client.get(uri, opts)
+    when "put"
+      res = coap_client.put(uri, @payload, opts)
+    when "del"
+      res = coap_client.del(uri, opts)
+    when "post"
+      res = coap_client.post(uri, @payload, opts)
+    when "fetch"
+      res = coap_client.fetch(uri, @payload, opts)
+    when "ipatch"
+      res = coap_client.ipatch(uri, @payload, opts)
+    end
+
+    handle_response(res)
+  end
+
+  private
+
+  def parse_sid
+    return if context[:sid].nil?
+
+    if !["get", "put", "post", "del"].include?(@method)
+      puts("Option --sid is not valid in #{@method} command.")
+      exit(-1)
+    end
+
+    s = context[:sid]
+    if (s =~ /\b\d/) != nil
+      $stderr.puts "MUP1CT SID num #{s}"
+      @sid = s
+    elsif (s =~ /\b[a-zA-Z\/][a-zA-Z\/:-]*/) != nil
+      $stderr.puts "MUP1CT SID name #{s}"
+      doc = File.open("../docs/sids.xml") { |f| Nokogiri::XML(f) }
+      n = doc.xpath("/yang-objs/obj[@full_path=\"#{s}\"]/@sid").first
+      if n != nil
+        @sid = n.value
+      else
+        puts("SID not found.")
+        exit(-1)
+      end
+    else
+      puts "invalid SID"
+      exit(-1)
+    end
+    $stderr.puts "MUP1CT SID #{@sid} -> #{sid_encode(@sid)}"
+  end
+
+  def parse_keys
+    return if context[:keys].nil? || context[:keys].empty?
+
+    if !["get", "put", "post", "del"].include?(@method)
+      puts("Option --keys is not valid in #{@method} command.")
+      exit(-1)
+    end
+
+    @keys_diag = []
+    context[:keys].each do |key|
+      key.strip!
+      case key
+      when /^(s):(.+)/
+        @keys_diag << "\"#{Shellwords.escape(%Q[#{$2}])}\""
+      when /^(i):([+-]?[0-9]+)/
+        @keys_diag << $2.to_i
+      when /^(b):(true|false)/
+        @keys_diag << $2
+      else
+        puts "Wrong instance identifier key #{key}"
+        exit(-1)
       end
     end
   end
-  class CoAP_Wrapper < Et::Handler::Base
-    def initialize base
-      super("CoAP", base, nil)
-      @rx_type = nil
-      @rx_data = nil
-      ll_handler_reg Et::Handler::Mup1::MUP1_CB_COAP, self
+
+  def parse_flags
+    return if context[:flags].nil? || context[:flags].empty?
+
+    if !["get", "fetch"].include?(@method)
+      puts("Option --flags not valid in #{@method} command.")
+      exit(-1)
     end
-    def rx type, data
-      if @rx_type
-        raise "rx over write detected"
+
+    @flags_diag = []
+    c_exist = false
+    d_exist = false
+
+    context[:flags].each do |flag|
+      $stderr.puts "MUP1CT flags #{flag}"
+      case flag
+      when /c=[c,n,a]/
+        if c_exist
+          puts "double c query"
+          exit(-1)
+        end
+        c_exist = true
+        @flags_diag << flag
+      when /d=[a,t]/
+        if d_exist
+          puts "double d query"
+          exit(-1)
+        end
+        d_exist = true
+        @flags_diag << flag
+      else
+        puts "Wrong c and/or d query"
+        exit(-1)
       end
-      @rx_type = type
-      @rx_data = data
     end
-    def mup1_frame_get timeout_ = nil
-      @rx_type = nil
-      @rx_data = nil
-      ll_poll
-      if @rx_type
-        return [@rx_type].pack("C"), @rx_data
+  end
+
+  def read_payload(argv)
+    if context[:input]
+      context[:input]
+    elsif !STDIN.tty?
+      STDIN.read
+    elsif !argv.empty?
+      argv.shift
+    end
+  end
+
+  def build_uri
+    @keys_diag ||= []
+    @flags_diag ||= []
+
+    uri_paths = [@datastore]
+    uri_paths << sid_encode(@sid) if @sid
+
+    cbor_seq = @keys_diag.map { |k| diag2cbor(k.to_s) }.join
+    uri_keys = [Base64.urlsafe_encode64(cbor_seq, padding: false)]
+    uri_keys.concat(@flags_diag)
+
+    $stderr.puts "MUP1CT method #{@method}"
+    $stderr.puts "MUP1CT paths  #{uri_paths}"
+    $stderr.puts "MUP1CT coap_url_keys: #{@keys_diag} -> #{uri_keys}"
+
+    uri = "/" + uri_paths.join("/")
+    uri += "?" + uri_keys.reject(&:empty?).join("&") if uri_keys.any? { |k| !k.empty? }
+    uri
+  end
+
+  def handle_response(res)
+    if res
+      print_response_code(res.code_class, res.code_detail)
+      if res.payload_rx && !res.payload_rx.empty?
+        write_output(res.payload_rx)
       end
+    else
+      STDERR.puts "No COAP response frame received"
     end
   end
-  def initialize mup1, pem_key
-    @mup1_wrapper = Mup1_Wrapper.new(mup1)
-    @mon = Mup1Con.new @mup1_wrapper
-    config = Et::Handler::Dtls_Config.new pem_key
-    @dtlsHandler = Create_Dtls_Handlers(config, @mup1_wrapper, nil)
-    @coapHandler = CoAP_Wrapper.new(@dtlsHandler)
+end
+
+# Dump command - CoAP POST to /dbg/dump
+# Firmware expects format "layer:group:ports:flags" (at least 3 colons).
+# Pad with trailing colons so users can use short forms like "a:vlan:"
+class DumpCommand < Command
+  def parse_args(argv)
+    arg = argv.empty? ? "" : argv.shift
+    colons = arg.count(":")
+    arg += ":" * (3 - colons) if colons < 3
+    @args = arg
   end
-  def mup1_frame_inj type, data = ""
-    if (type == "c")
-      @dtlsHandler.tx data
+
+  def response_wait
+    context[:wait] || 3 * COAP_ACK_WAIT_TIME
+  end
+
+  def execute
+    coap_client = CoapClient.new(context[:mup1], context[:tracer], false, nil)
+    res = coap_client.post("dbg/dump", @args)
+
+    if res
+      print_response_code(res.code_class, res.code_detail)
+      write_output(res.payload_rx) if res.payload_rx && !res.payload_rx.empty?
+    else
+      STDERR.puts "No COAP response frame received"
     end
-    #@mup1.mup1_frame_inj type, data
-  end
-  def mup1_frame_get timeout_ = nil
-    return @coapHandler.mup1_frame_get timeout_
   end
 end
 
-def success_detail (detail)
-  case detail.to_i
-  when 1
-    return "Created"
-  when 2
-    return "Deleted"
-  when 3
-    return "Valid"
-  when 4
-    return "Changed"
-  when 5
-    return "Content"
-  else
-    return "Unknown"
+# Trace command - CoAP POST to /dbg/trace
+class TraceCommand < Command
+  def parse_args(argv)
+    @args = argv.empty? ? ":" : argv.shift
+  end
+
+  def response_wait
+    context[:wait] || 3 * COAP_ACK_WAIT_TIME
+  end
+
+  def execute
+    coap_client = CoapClient.new(context[:mup1], context[:tracer], false, nil)
+    res = coap_client.post("dbg/trace", @args)
+
+    if res
+      print_response_code(res.code_class, res.code_detail)
+      write_output(res.payload_rx) if res.payload_rx && !res.payload_rx.empty?
+    else
+      STDERR.puts "No COAP response frame received"
+    end
   end
 end
 
-def c_error_detail (detail)
-  case detail.to_i
-  when 0
-    return "Bad Request"
-  when 1
-    return "Unauthorized"
-  when 2
-    return "Bad Option"
-  when 3
-    return "Forbidden"
-  when 4
-    return "Not Found"
-  when 5
-    return "Method Not Allowed"
-  when 6
-    return "Not Acceptable"
-  when 8
-    return "Request Entity Incomplete"
-  when 9
-    return "Conflict"
-  when 12
-    return "Precondition Failed"
-  when 13
-    return "Request Entity Too Large"
-  when 15
-    return "Unsupported Content-Format"
-  else
-    return "Unknown"
+# Sysrq command (deprecated) - wraps dump/trace via CoAP
+class SysrqCommand < Command
+  def parse_args(argv)
+    @subcommand = argv.shift
+    case @subcommand
+    when "trace", "dump"
+      STDERR.puts "WARNING: 'sysrq' is deprecated, use '#{@subcommand}' instead"
+      @inner = CommandFactory.create(@subcommand, context)
+      @inner.parse_args(argv)
+    else
+      puts "sysrq subcommand invalid"
+      exit(-1)
+    end
+  end
+
+  def response_wait
+    @inner.response_wait
+  end
+
+  def execute
+    @inner.execute
   end
 end
 
-def s_error_detail (detail)
-  case detail.to_i
-  when 0
-    return "Internal Server Error"
-  when 1
-    return "Not Implemented"
-  when 2
-    return "Bad Gateway"
-  when 3
-    return "Service Unavailable"
-  when 4
-    return "Gateway Timeout"
-  when 5
-    return "Proxying Not Supported"
-  else
-    return "Unknown"
+# Listen command
+class ListenCommand < Command
+  def response_wait
+    -1  # Forever by default
+  end
+
+  def execute
+    forever = context[:wait_forever] || (context[:wait].nil? || context[:wait] < 0)
+    wait_time = context[:wait] ? context[:wait].abs : 1
+
+    poll_until(wait_time, forever: forever)
   end
 end
 
-def end_session
-  #Send COAP ping to terminate session
-  ping_frame = coap_frame_build COAP_TYPE_CONFIRMABLE, 0, 0
-  $mup1.mup1_frame_inj "c", ping_frame.enc
-end
-
-
-# Open socket to serial line
-term = URI($device)
-sock = nil
-sport = 123
-if term.scheme.nil?
-  require "serialport"
-  puts "Opening serial port at #{$device}"
-  conf = {
-    "baud"      => 115200,
-    "data_bits" => 8,
-    "stop_bits" => 1,
-    "parity"    => SerialPort::NONE
+# Command factory
+class CommandFactory
+  COMMANDS = {
+    "ping" => PingCommand,
+    "coap" => CoapCommand,
+    "coaps" => CoapCommand,
+    "cc" => CcCommand,
+    "dump" => DumpCommand,
+    "trace" => TraceCommand,
+    "sysrq" => SysrqCommand,
+    "listen" => ListenCommand
   }
-  sock = SerialPort.new($device, conf)
-  sock.flow_control = SerialPort::NONE
-else
-  sock = TCPSocket.open(term.host, term.port)
-  sport = sock.addr[1]
-end
-$mup1 = MUP1.new("easytest", sock)
 
-if ($dtls_enable)
-  pem_key = nil
-  if ($opt[:pem_key] != nil)
-    pem_key = File.read $opt[:pem_key]
-  else
-    key_file_name = "client_key.pem"
-    if (File.exist? key_file_name)
-      pem_key = File.read key_file_name
+  def self.create(name, context)
+    klass = COMMANDS[name]
+    return nil unless klass
+
+    cmd = klass.new(context)
+    cmd.dtls_enable = (name == "coaps") if cmd.respond_to?(:dtls_enable=)
+    cmd
+  end
+
+  def self.valid?(name)
+    COMMANDS.key?(name)
+  end
+
+  def self.names
+    COMMANDS.keys
+  end
+end
+
+# Main application class
+class Mup1ctApp
+  def initialize
+    @opt = {}
+    @cc_opt = { :keys => [], :flags => [], :datastore => "c" }
+    @opt[:checksum_type] = :internet
+  end
+
+  def run(argv)
+    parse_options(argv)
+    validate_options
+
+    cmd_name = argv.shift
+    if cmd_name.nil? || !CommandFactory.valid?(cmd_name)
+      puts "command is invalid" if cmd_name
+      puts "No command specified!" if cmd_name.nil?
+      puts
+      puts @optparser
+      exit(-1)
+    end
+
+    setup_io
+    context = setup_handlers(cmd_name)
+
+    command = CommandFactory.create(cmd_name, context)
+    command.datastore = @cc_opt[:datastore] if command.respond_to?(:datastore=)
+    command.parse_args(argv)
+
+    command.execute
+
+    handle_trace_timeout(context)
+  end
+
+  private
+
+  def parse_options(argv)
+    @optparser = OptionParser.new do |opts|
+      opts.banner = <<~BANNER
+        mup1ct - MUP1 CoAP/CORECONF client tool
+
+        Usage:
+          mup1ct [options] ping
+          mup1ct [options] coap[s] (get|put|del|post|fetch|ipatch) <URL-PATH>
+          mup1ct [options] dump <LAYER>:<GROUP>:<PORTS>[:<FLAGS>[:<ACTION>]]
+          mup1ct [options] trace <MODULE>:<LEVEL>
+          mup1ct [options] sysrq (trace|dump) ...  (deprecated)
+          mup1ct [options] listen
+
+      BANNER
+
+      opts.separator "General options:"
+      opts.on("-d", "--device URL", "Terminal URL (e.g., termhub://10.0.0.2:4000)") { |d| @opt[:device] = d }
+      opts.on("-i", "--input FILE", "Read payload from FILE instead of STDIN") { |i| @opt[:input] = i }
+      opts.on("-o", "--output FILE", "Write output to FILE instead of STDOUT") { |o| @opt[:output] = o }
+      opts.on("-w", "--wait SEC", Float, "Response wait time (-1 = forever)") { |w| @opt[:wait] = w }
+      opts.on("-t", "--trace", "Print traces to STDERR") { |t| @opt[:trace] = t }
+      opts.on("-T", "--trace-timeout SEC", Float, "Wait SEC for traces after command") { |tw| @opt[:Trace] = tw }
+      opts.on("-k", "--key FILE.pem", "PEM key file for DTLS (coaps only)") { |k| @opt[:pem_key] = k }
+      opts.on("--checksum-type TYPE", [:internet, :crc32], "MUP1 checksum (default: internet)") { |cs| @opt[:checksum_type] = cs }
+
+      opts.separator ""
+      opts.separator "CoAP/CC options:"
+      opts.on("--content-type NUM", Integer, "CoAP Content-Format option") { |ct| @cc_opt[:content_type] = ct }
+      opts.on("--accept NUM", Integer, "CoAP Accept option") { |ct| @cc_opt[:accept] = ct }
+
+      opts.separator ""
+      opts.separator "CC command options (Deprecated, use mup1cc instead):"
+      opts.separator "mup1ct [options] cc (get|put|del|post|fetch|ipatch) [--sid SID] [--ds DS]"
+      opts.on("--ds DS", "Datastore (default: c)") { |ds| @cc_opt[:datastore] = ds }
+      opts.on("--sid SID", "SID number to address") { |a| @cc_opt[:sid] = a }
+      opts.on("--keys K1,K2,...", Array, "Instance keys (s:str, i:int, b:bool)") { |k| @cc_opt[:keys] = k }
+      opts.on("--flags F1,F2,...", Array, "Query flags (c=c|n|a, d=a|t)") { |f| @cc_opt[:flags] = f }
+
+      opts.separator EXAMPLES
+      opts.on_tail("-h", "--help", "Show this help") { puts opts; exit }
+    end
+    @optparser.parse!(argv)
+  end
+
+  def validate_options
+    if !@opt[:trace].nil? && !@opt[:Trace].nil?
+      puts "Both -t and -T cannot be specified"
+      exit(-1)
+    end
+  end
+
+  def setup_io
+    $stdin.binmode
+    $stdout.binmode
+
+    if @opt[:input]
+      if !File.exist?(@opt[:input])
+        puts "File does not exist"
+        exit(-1)
+      end
+      file = File.open(@opt[:input])
+      file.binmode
+      @input_data = file.read
+      file.close
+    end
+
+    if @opt[:output]
+      @output_file = File.open(@opt[:output], "w")
+    end
+  end
+
+  def setup_handlers(cmd_name)
+    device = get_device
+    tracer = Tracer.new(:silent)
+
+    dut = Et::Handler::Dut.new(device)
+
+    # Check if libeasy Mup1 handler supports checksum_type parameter
+    mup1_params = Et::Handler::Mup1.instance_method(:initialize).parameters
+    has_checksum_type = mup1_params.any? { |p| p[1] == :checksum_type }
+
+    if has_checksum_type
+      mup1 = Et::Handler::Mup1.new(dut, tracer, true, @opt[:checksum_type])
     else
-      pem_key = pem_ec_key_gen
-      File.write key_file_name, pem_key
+      if @opt[:checksum_type] != :internet
+        STDERR.puts "Warning: This version of libeasy does not support CRC32 checksum"
+      end
+      mup1 = Et::Handler::Mup1.new(dut, tracer, true)
     end
-  end
-  # Add security layer which should appear identical to $mup1
-  $dtls = Dtls_Wrapper.new($mup1, pem_key)
-  $mup1 = $dtls
-end
 
-if ($cmd == "coap")
-  payload_expected = false
-  case $coap_method
-  when "get"
-    payload_expected = true
-    method = COAP_CODE_GET
-  when "put"
-    method = COAP_CODE_PUT
-  when "del"
-    method = COAP_CODE_DEL
-  when "post"
-    method = COAP_CODE_POST
-  end
+    dtls_enable = (cmd_name == "coaps")
+    if dtls_enable
+      mon = Mup1Con.new(mup1)
+    end
 
-  if !$coap_payload.nil?
-    # Payload must be added to COAP frame. Payload is split into chonk's of Block 1 size
-    $pl_split = $coap_payload.scan(/.{1,#{$blok1_size}}/m)
-  else
-    # No Payload to add. The split array contains just nil
-    $pl_split = Array.new(1, $coap_payload)
-  end
+    trace_handler = TraceHandler.new(mup1)
+    trace_handler.trace_enabled = @opt[:trace] || @opt[:Trace]
 
-  # Build the MUP1 COAP frame to inject the first element in the Payload split
-  $inj_coap_frame = coap_frame_build COAP_TYPE_CONFIRMABLE, method, sport, $coap_url_paths, $coap_url_keys, $pl_split[0]
-  if ($pl_split.size > 1)
-    # More blocks to transmit - create the block1 option parameters
-    $inj_coap_frame.block1_block_size = $blok1_size
-    $inj_coap_frame.block1_more = 1
-    $inj_coap_frame.block1_num = 0
+    ping_handler = PingHandler.new(mup1)
+
+    # Calculate wait time
+    wait = @opt[:wait]
+    wait_forever = wait && wait.to_i < 0
+
+    {
+      :dut => dut,
+      :mup1 => mup1,
+      :tracer => tracer,
+      :trace_handler => trace_handler,
+      :ping_handler => ping_handler,
+      :input => @input_data,
+      :output_file => @output_file,
+      :wait => wait ? wait.to_i.abs : nil,
+      :wait_forever => wait_forever,
+      :pem_key => @opt[:pem_key],
+      :content_type => @cc_opt[:content_type],
+      :accept => @cc_opt[:accept],
+      :sid => @cc_opt[:sid],
+      :keys => @cc_opt[:keys],
+      :flags => @cc_opt[:flags]
+    }
   end
 
-  #Inject the MUP1 COAP frame
-  $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
+  def get_device
+    return @opt[:device] if @opt[:device]
 
-  #First element has been transmitted
-  $pl_split.shift
-end
-
-if ($cmd == "cc")
-  payload_expected = false
-  case $cc_method
-  when "get"
-    payload_expected = true
-    method = COAP_CODE_GET
-  when "put"
-    method = COAP_CODE_PUT
-  when "del"
-    method = COAP_CODE_DEL
-  when "post"
-    method = COAP_CODE_POST
-  when "fetch"
-    payload_expected = true
-    method = COAP_CODE_FETCH
-  when "ipatch"
-    method = COAP_CODE_IPATCH
-  end
-
-  $stderr.puts "MUP1CT method #{$cc_method}"
-  if !$coap_payload.nil?
-    # Payload must be added to COAP frame. Payload is split into chonk's of Block 1 size
-    $pl_split = $coap_payload.scan(/.{1,#{$blok1_size}}/m)
-  else
-    # No Payload to add. The split array contains just nil
-    $pl_split = Array.new(1, $coap_payload)
-  end
-
-  $coap_url_paths = [$cc_opt[:datastore]]
-  $coap_url_paths << sid_encode($cc_opt[:sid]) if !$cc_opt[:sid].nil?
-
-  cbor_seq = ""
-  $keys_diag.each do |k| 
-    stdout_str, stderr_str, status = Open3.capture3("cbor-diag --from diag --to bytes", :stdin_data=>k)
-    if (status.to_i == 0)
-      cbor_seq += stdout_str
+    if File.exist?('.mscc-libeasy-topology.yaml')
+      conf = YAML.load_file(".mscc-libeasy-topology.yaml")
     else
-      puts "cbor-diag error: cannot process #{k}"
-      puts " error msg: #{stderr_str}"
-      exit -1
+      conf = YAML.load_file("#{ENV["HOME"]}/.mscc-libeasy-topology.yaml")
     end
+    conf["dut"]["terminal"]
   end
 
-  $coap_url_keys = [Base64.urlsafe_encode64(cbor_seq, padding: false)]
+  def handle_trace_timeout(context)
+    return unless @opt[:Trace]
 
-  $flags_diag.each do |f|
-    $coap_url_keys << f
-  end
+    trace_wait = @opt[:Trace].to_i.abs
+    trace_restart = @opt[:Trace].to_i < 0
 
-  $stderr.puts "MUP1CT paths  #{$coap_url_paths}"
-  $stderr.puts "MUP1CT coap_url_keys: #{$keys_diag} -> #{$coap_url_keys}"
-    
-
-  # Build the MUP1 COAP frame to inject the first element in the Payload split
-  $inj_coap_frame = coap_frame_build COAP_TYPE_CONFIRMABLE, method, sport, $coap_url_paths, $coap_url_keys, $pl_split[0]
-
-
-  if ($pl_split.size > 1)
-    # More blocks to transmit - create the block1 option parameters
-    $inj_coap_frame.block1_block_size = $blok1_size
-    $inj_coap_frame.block1_more = 1
-    $inj_coap_frame.block1_num = 0
-  end
-
-  #Inject the MUP1 COAP frame
-  $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
-
-  #First element has been transmitted
-  $pl_split.shift
-end
-
-if ($cmd == "ping")
-  #Inject the MUP1 COAP frame
-  $mup1.mup1_frame_inj "p"
-end
-
-if ($cmd == "sysrq")
-  #SYS request command
-  if ($sys_trace)
-    data = SYSREQ.new
-    data.cmd = "t".ord
-    data << $sys_trace_args
-    $mup1.mup1_frame_inj "s", data
-  end
-  if ($sys_dump)
-    data = SYSREQ.new
-    data.cmd = "d".ord
-    data << $sys_dump_args
-    $mup1.mup1_frame_inj "s", data
+    trace_end = Time.now + trace_wait
+    while Time.now < trace_end
+      context[:dut].poll
+      trace_end = Time.now + trace_wait if trace_restart
+    end
   end
 end
 
-cbor = String.new
-
-trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-pong_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
-responce_received = false
-ack_received = false
-
-# Get the response
-while true do
-  if (coap_op && !ack_received)
-    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - ack_start
-    if (elapsed > (($pl_split.size != 0) ? COAP_ACK_WAIT_TIME : COAP_LAST_ACK_WAIT_TIME))
-      STDERR.print "R"
-      #Ack time expired - retransmit
-      #Inject the MUP1 COAP frame
-      $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
-      ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
-  end
-  if (!responce_received)
-    #So far no respond received - check for response time out
-    elapsed = $responce_wait_forever ? 0 :
-              Process.clock_gettime(Process::CLOCK_MONOTONIC) - responce_start
-
-    if (elapsed > $response_wait)
-      if ($cmd == "ping")
-        STDERR.puts "No PONG frame received"
-      end
-      if (coap_op)
-        end_session
-        STDERR.puts "No COAP response frame received"
-      end
-      if ($cmd == "listen")
-        STDERR.puts "End of listen"
-      end
-      return
-    end
-
-    if (coap_op && !ack_received)
-      mup1_wait = COAP_ACK_WAIT_TIME
-    else
-      mup1_wait = $response_wait - elapsed
-    end
-  else
-    #Response is received - check for trace time out
-    if ($trace)
-      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - trace_start
-      if (elapsed > $trace_wait)
-        if (coap_op)
-          end_session
-        end
-        return
-      end
-    else
-      if (coap_op)
-        end_session
-      end
-      return
-    end
-
-    mup1_wait = $trace_wait - elapsed
+# Main entry point
+if __FILE__ == $0
+  if ARGV.empty?
+    puts "No command specified!"
+    puts
+    app = Mup1ctApp.new
+    app.run(["--help"])
+    exit 0
   end
 
-  # Get the MUP1 frame
-  type, mup1_data = $mup1.mup1_frame_get mup1_wait
-
-  if (!type)
-    #No frame is received - mup1_wait timeout
-    next
-  end
-
-  if $trace && (type == 'T')    #Trace frame
-    STDERR.print "#{mup1_data}"
-    if $trace_restart
-      trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
-    if ($sys_dump)
-        responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
-    next
-  end
-
-  if responce_received
-    next
-  end
-
-  if (type == 'P')    #Ping response frame
-    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - pong_start
-    mup1_data_elements = mup1_data.split(' ')
-    STDERR.puts "Pong received in #{(elapsed*1000).truncate(2)} ms"
-    STDERR.puts "Build #{mup1_data_elements[0]}"
-    STDERR.puts "Up Time #{mup1_data_elements[1]}"
-    if (!mup1_data_elements[2].nil?)
-        STDERR.puts "Data size #{mup1_data_elements[2]}"
-    end
-    if (!mup1_data_elements[3].nil?)
-        STDERR.puts "Version #{mup1_data_elements[3]}"
-    end
-    responce_received = true
-    trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    next
-  end
-
-  if (type == 'C')    #COAP response frame
-    #Extract and decode the COAP frame
-    rx_coap_frame = CoapFrame.new mup1_data
-    rx_id = rx_coap_frame.msgid
-    tx_id = $inj_coap_frame.msgid
-    if (rx_id != tx_id)
-        STDERR.puts "Received msgid #{rx_id}, expected #{tx_id}"
-        next
-    end
-
-    block2_more = (!rx_coap_frame.block2_more.nil? && (rx_coap_frame.block2_more == 1)) ? true : false
-    ack_received = (rx_coap_frame.type == COAP_TYPE_ACK) ? true : false
-
-    #Decode the return code
-    cdetail = rx_coap_frame.code_detail
-    cclass = rx_coap_frame.code_class
-    if (cclass == 2)
-      if (($pl_split.size == 0) && !block2_more)
-        STDERR.puts "RESPONSE-CODE: class 2 detail #{cdetail} Success #{success_detail(cdetail)}"
-      end
-    end
-    if (cclass == 4)
-      STDERR.puts "RESPONSE-CODE: class 4 detail #{cdetail} Client Error #{c_error_detail(cdetail)}"
-      end_session
-      return
-    end
-    if (cclass == 5)
-      STDERR.puts "RESPONSE-CODE: class 5 detail #{cdetail} Server Error #{s_error_detail(cdetail)}"
-      end_session
-      return
-    end
-    if !rx_coap_frame.payload.nil?
-        #Payload is received - Build the CBOR buffer
-        cbor = cbor + rx_coap_frame.payload
-
-        if ($cmd == "listen")
-          #Listen mode
-          if (!block2_more)
-            Open3::popen3("cbor-diag --from bytes --to compact") do |_i, _o, _e, _t|
-              _i.write cbor
-              _i.flush
-              _i.close
-              puts _o.gets
-              puts _e.gets
-              _o.close
-              _e.close
-            end
-            cbor.clear()
-          end
-          #Get next block
-          next
-        end
-
-        if (block2_more)
-            STDERR.print "."
-            #This is get block-wise transfer
-            #Inject MUP1 COAP frame to get next block
-            $inj_coap_frame.msgid += 1  # Increment the message ID
-            $inj_coap_frame.block2_num += 1
-            $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
-            # Restart responce timer
-            ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-            ack_received = false
-
-            #Get next block
-            next
-        end
-
-        if !$output_file.nil?
-            #Print to output file
-            $output_file.write(cbor)
-            $output_file.close
-        else
-            #Print to STDOUT with no new line
-            print "#{cbor}"
-        end
-    else
-        # No payload received
-        if ($cmd == "listen")
-          next
-        end
-
-        if payload_expected
-            STDERR.puts "No payload in received COAP frame"
-            next
-        end
-
-        if ($pl_split.size > 0)
-          STDERR.print "."
-          # Not all payload is block-wise transmitted - Inject the MUP1 COAP frame with next block
-          $inj_coap_frame.msgid += 1  # Increment the message ID
-          $inj_coap_frame.block1_num += 1
-          $inj_coap_frame.payload = $pl_split.shift
-          $inj_coap_frame.block1_more = ($pl_split.size == 0) ? 0 : 1
-
-          $mup1.mup1_frame_inj "c", $inj_coap_frame.enc
-          # Restart response timer
-          ack_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          responce_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          ack_received = false
-          next
-        else
-          STDERR.puts "All blocks transmitted"
-        end
-    end
-
-    responce_received = true
-    trace_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-#Decode the CBOR payload
-#cbor_decoded = CBOR.decode(cbor)
-#puts "*****cbor_decoded #{cbor_decoded}"
-#puts "****cbor_decoded[7026][0][134] #{cbor_decoded[7026][0][134]}"
-#puts "****cbor_decoded[7026][0][3] #{cbor_decoded[7026][0][3]}"
-  end
+  app = Mup1ctApp.new
+  app.run(ARGV)
 end

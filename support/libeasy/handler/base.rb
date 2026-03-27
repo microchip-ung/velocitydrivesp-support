@@ -57,6 +57,10 @@ module Et
         end
       end
 
+      def handler_clear type
+        @handlers[type] = []
+      end
+
       def t(level, msg)
         raise "Invalid level" if not [:fatal, :err, :info, :debug].include? level
 

@@ -353,6 +353,7 @@ end
 $opts = {:continue_on_error => false,
          :device => get_device,
          :query => [],
+         :checksum_type => :internet,
         } # Add more default options here
 
 OptionParser.new do |opts|
@@ -376,6 +377,12 @@ OptionParser.new do |opts|
     opts.on("-k", "--key KEY_FILE.pem", "use DTLS with this key file.",
             "If no key file is provided, try to connect with out DTLS") do |o|
         $opts[:key] = o
+    end
+
+    opts.on("--checksum-type internet-checksum|crc32", ["internet-checksum", "crc32"],
+            "MUP1 checksum type: internet-checksum (default) or crc32") do |o|
+        # Map CLI argument to internal symbol (internet-checksum -> :internet)
+        $opts[:checksum_type] = (o == "internet-checksum") ? :internet : :crc32
     end
 
     opts.on("-m", "--method fetch|ipatch|get|put|post|delete", ["fetch", "ipatch", "get", "put", "post", "delete"],
@@ -466,7 +473,7 @@ raise "Missing method!" if $opts[:method].nil? and $opts[:log_run].nil?
 ################################################################################
 tracer = Tracer.new $opts[:sys_trace]
 dut = Et::Handler::Dut.new $opts[:device]
-m = Et::Handler::Mup1.new dut, tracer
+m = Et::Handler::Mup1.new dut, tracer, true, $opts[:checksum_type]
 mon = Mup1Con.new m
 if $opts[:key] != nil
     if !(File.exist? $opts[:key])

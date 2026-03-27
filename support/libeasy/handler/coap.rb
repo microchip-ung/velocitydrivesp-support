@@ -10,6 +10,14 @@ require_relative '../frame/coap.rb'
 module Et
   module Handler
     class Coap < Base
+      # Block sizes for CoAP block-wise transfers
+      # CoAP requires power-of-2 block sizes (16, 32, 64, 128, 256, etc.)
+      DEFAULT_BLOCK_SIZE = 256
+      # DTLS adds ~29 bytes overhead (13 header + 8 IV + 8 MAC)
+      # With MUP1 300 byte limit: 128 + 22 (CoAP) + 29 (DTLS) + 8 (MUP1) + 9 (escape) ≈ 196 < 300 ✓
+      # 256 byte blocks would exceed the limit with DTLS
+      DTLS_BLOCK_SIZE = 128
+
       class ReqBlockWise
         attr_reader :mid, :payload_rx, :code_class, :code_detail
 
@@ -23,6 +31,7 @@ module Et
           @payload_rx = ""
           @opts = opts
           @state = :state_req_tx
+          @block_size = opts[:block_size] || DEFAULT_BLOCK_SIZE
 
           # Keeps track on how much of the request has been send and ack'ed
           @req_tx = nil
@@ -141,7 +150,7 @@ module Et
 
           # Always put a block2 option to ask the server to fragment the response.
           # Even put/post can genrate error messages which may need to be fragmented
-          f.block2_block_size = 256 # configurable?
+          f.block2_block_size = @block_size
           f.block2_more = 0
           f.block2_num = 0
 
@@ -151,13 +160,13 @@ module Et
 
             if @payload_tx
               f.content_type = @opts[:content_type] if @opts[:content_type]
-              if @payload_tx.bytesize > 256
+              if @payload_tx.bytesize > @block_size
                 start = 0
                 start = @req_tx_ack if @req_tx_ack
-                f.payload = @payload_tx.byteslice(start, 256)
+                f.payload = @payload_tx.byteslice(start, @block_size)
 
-                f.block1_block_size = 256 # configurable?
-                f.block1_num = @req_tx / 256
+                f.block1_block_size = @block_size
+                f.block1_num = @req_tx / @block_size
 
                 @req_tx += f.payload.bytesize
                 if @req_tx < @payload_tx.bytesize
@@ -196,10 +205,13 @@ module Et
         super "CoAP", lower_layer, tracer
         if lower_layer.instance_of? Mup1
           ll_handler_reg Mup1::MUP1_CB_COAP, self
+          @block_size = DEFAULT_BLOCK_SIZE
         elsif lower_layer.instance_of? Dtls_Application
           ll_handler_reg 0, self
+          @block_size = DTLS_BLOCK_SIZE
         else
           t(:err, "Coap.initialize: lower_layer is unknown");
+          @block_size = DEFAULT_BLOCK_SIZE
         end
       end
 
@@ -218,7 +230,9 @@ module Et
       end
 
       def coap_req code, uri, payload = nil, opts = {}
-        @req = ReqBlockWise.new self, code, uri, payload, opts
+        # Use DTLS block size if lower layer is DTLS, unless caller overrides
+        req_opts = { block_size: @block_size }.merge(opts)
+        @req = ReqBlockWise.new self, code, uri, payload, req_opts
         ts, f = @req.next_step
         timeout_abs_set(ts)
         tx(f)
