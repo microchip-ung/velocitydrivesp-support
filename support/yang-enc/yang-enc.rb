@@ -269,7 +269,7 @@ end
 
 def type2cbor(type, value, continue_on_error = false, unions = [])
     begin
-        case type.name
+        case type.builtin.name
 
         when 'enumeration'
             if unions.empty?
@@ -357,7 +357,7 @@ def type2cbor(type, value, continue_on_error = false, unions = [])
             sid = nil
             # See RFC 9254 section 6.10 and 6.10.1.
             type.deref.map(&:derived_from).reduce(:&).each do |id|
-                sid = id.sid if id.mod == type.mod and id.name == value
+                sid = id.sid if id.mod == type.source_module and id.name == value
                 sid = id.sid if value =~ /(.+):(.+)/ and $1 == id.mod and $2 == id.name
             end
             # One identity is guaranteed to match because the input has been schema validated.
@@ -376,7 +376,7 @@ def type2cbor(type, value, continue_on_error = false, unions = [])
 
         end
     rescue => e
-        print_error("Error encoding #{value or "nil"} as type #{type ? type.name : "nil"}: #{e.message}", continue_on_error)
+        print_error("Error encoding #{value or "nil"} as type #{type ? type.builtin.name : "nil"}: #{e.message}", continue_on_error)
         return value
     end
 end
@@ -410,7 +410,7 @@ end
 
 # All of the key values are strings but a few needs to be converted to other types.
 def convert_iid_key_value(type, key, value)
-    case type.name
+    case type.builtin.name
     when 'int8', 'int16', 'int32', 'uint8', 'uint16', 'uint32'
         Integer(value) # Convert String to Integer
     when 'boolean'
@@ -490,6 +490,25 @@ def json_validate_iid(schema, iid)
     return s, all_keys
 end
 
+# A FETCH/iPATCH/POST payload is a CBOR sequence of entries, each a single map
+# of one instance-identifier to its value (draft-ietf-core-comi-21 sections
+# 3.1.3, 3.2.3, 3.5). The instance path and its value are extracted as the sole
+# key/value pair, so an entry that is not a single-key map cannot be processed
+# at all. Raise a clear, content-format-aware error instead of silently taking
+# the first of several keys (or failing obscurely on a non-map entry) - this is
+# the shape users most often get wrong in the request YAML.
+def validate_instance_entry!(entry, content_format)
+    unless entry.is_a?(Hash)
+        kind = entry.nil? ? 'null' : (entry.is_a?(Array) ? 'array' : entry.class.to_s)
+        raise "#{content_format.upcase} entry must be a map of a single instance path " \
+              "to its value, got #{kind}"
+    end
+    if entry.length != 1
+        raise "#{content_format.upcase} entry must have exactly one key/value pair " \
+              "(the instance path and its value), got #{entry.length}: #{entry.keys.join(', ')}"
+    end
+end
+
 # Validate JSON data against schema
 def json_validate(schema, json, content_format, continue_on_error = false)
     def validate(schema, json, content_format, continue_on_error)
@@ -508,7 +527,7 @@ def json_validate(schema, json, content_format, continue_on_error = false)
         raise "Input is not an Array!" if !json.is_a? Array
         json.each do |j|
             next if content_format == 'fetch' and j.is_a? String
-            print_error("YANG instance must be a single JSON map!", continue_on_error) if !j.is_a?(Hash) or j.length != 1
+            validate_instance_entry!(j, content_format)
             key = j.keys[0]
             value = j.values[0]
             iid_schema, _ = json_validate_iid(schema, key)
@@ -525,6 +544,7 @@ end
 # Validation of a null value is skipped in all other than 'post' content formats,
 # as a null value is always valid in content formats like 'fetch' and 'ipatch'.
 def instance2cbor(schema, json, content_format, continue_on_error)
+    validate_instance_entry!(json, content_format)
     key = json.keys[0]
     value = json.values[0]
     key_part, iid_schema = iid2cbor(schema, key)
@@ -561,53 +581,53 @@ end
 # Return true iff 'value' can possibly be a JSON encoding of YANG type 'type'.
 # See RFC 7951 section 6.10.
 def match_type_json(type, value)
-    return match_type_json(type.deref.type, value) if type.name == 'leafref'
+    return match_type_json(type.deref.type, value) if type.builtin.name == 'leafref'
 
     case value
 
     when Integer
-        return (['int8', 'int16', 'int32', 'uint8', 'uint16', 'uint32'].include?(type.name) and
+        return (['int8', 'int16', 'int32', 'uint8', 'uint16', 'uint32'].include?(type.builtin.name) and
                 type.ranges.any? {|r| r.include? value})
 
     when [nil]
-        return type.name == 'empty'
+        return type.builtin.name == 'empty'
 
     when true, false
-        return type.name == 'boolean'
+        return type.builtin.name == 'boolean'
 
     when String
         begin
             x = Integer(value)
-            if ['int64', 'decimal64', 'uint64'].include?(type.name)
+            if ['int64', 'decimal64', 'uint64'].include?(type.builtin.name)
                 return type.ranges.any? {|r| r.include? x}
             end
         rescue ArgumentError
             begin
                 x = BigDecimal(value)
-                if type.name == 'decimal64'
+                if type.builtin.name == 'decimal64'
                     return type.ranges.any? {|r| r.include? x}
                 end
             rescue ArgumentError
             end
         end
 
-        if type.name == 'string'
+        if type.builtin.name == 'string'
             return (type.patterns.all? {|p| p.match? value} and
                     type.length.any? {|l| l.include? value.length})
-        elsif type.name == 'binary'
+        elsif type.builtin.name == 'binary'
             return type.length.any? {|l| l.include? value.length}
-        elsif type.name == 'bits'
+        elsif type.builtin.name == 'bits'
             return value.split(' ').all? {|name| type.bits[name] != nil}
-        elsif type.name == 'enumeration'
+        elsif type.builtin.name == 'enumeration'
             return type.enums[value] != nil
-        elsif type.name == 'identityref'
+        elsif type.builtin.name == 'identityref'
             type.deref.map(&:derived_from).reduce(:&).each do |id|
                return true if id.name == value
                return true if value =~ /(.+):(.+)/ and $1 == id.mod and $2 == id.name
             end
             return false
         else
-            return type.name == 'instance-identifier'
+            return type.builtin.name == 'instance-identifier'
         end
     end
 
@@ -731,16 +751,6 @@ def cbor2json(node, cbor, content_format, continue_on_error)
 
     when 'rpc', 'action'
         if cbor.nil? or (cbor.is_a? Hash and cbor.empty?)
-            def mandatory?(node)
-                return node if node.mandatory
-                node.substms.each do |s|
-                    m = mandatory?(s)
-                    return m if m
-                end
-                return nil
-            end
-            mandatory = mandatory?(node)
-            raise "#{node.kw} #{node.arg}: Mandatory '#{mandatory.kw} #{mandatory.arg}' not found!" if mandatory
             return cbor.nil? ? nil : {} # This is ok if there are no mandatory parameters
         end
 
@@ -840,7 +850,7 @@ end
 
 def type2json(type, value, continue_on_error = false)
     begin
-        case type.name
+        case type.builtin.name
 
         when 'int8', 'int16', 'int32', 'uint8', 'uint16', 'uint32'
             value
@@ -903,27 +913,27 @@ def type2json(type, value, continue_on_error = false)
 
         end
     rescue => e
-        print_error("Error decoding #{value or "nil"} as type #{type ? type.name : "nil"}: #{e.message}", continue_on_error)
+        print_error("Error decoding #{value or "nil"} as type #{type ? type.builtin.name : "nil"}: #{e.message}", continue_on_error)
         return value
     end
 end
 
 # Return true iff 'value' can possibly be a CBOR encoding of YANG type 'type'.
 def match_type_cbor(type, value)
-    return match_type_cbor(type.deref.type, value) if type.name == 'leafref'
+    return match_type_cbor(type.deref.type, value) if type.builtin.name == 'leafref'
 
     case value
 
     when CBOR::Tagged
         begin
-            if value.tag == 4 and type.name == 'decimal64'
+            if value.tag == 4 and type.builtin.name == 'decimal64'
                 x = BigDecimal(decode_decimal64(value))
                 return type.ranges.any? {|r| r.include? x}
-            elsif value.tag == 44 and type.name == 'enumeration'
+            elsif value.tag == 44 and type.builtin.name == 'enumeration'
                 return type.enums[value.value] != nil
-            elsif value.tag == 43 and type.name == 'bits'
+            elsif value.tag == 43 and type.builtin.name == 'bits'
                 return value.value.split(' ').all? {|name| type.bits[name] != nil}
-            elsif value.tag == 45 and type.name == 'identityref'
+            elsif value.tag == 45 and type.builtin.name == 'identityref'
                 return (type.deref.map(&:derived_from).reduce(:&).find {|id| id.sid == value.value} != nil)
             end
         rescue => e
@@ -931,20 +941,20 @@ def match_type_cbor(type, value)
         end
 
     when nil
-        return type.name == 'empty'
+        return type.builtin.name == 'empty'
 
     when true, false
-        return type.name == 'boolean'
+        return type.builtin.name == 'boolean'
 
     when Integer
-        return (['int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'].include?(type.name) and
+        return (['int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64'].include?(type.builtin.name) and
                 type.ranges.any? {|r| r.include? value})
 
     when String
-        if type.name == 'binary'
+        if type.builtin.name == 'binary'
             return (value.encoding == Encoding::ASCII_8BIT and
                     type.length.any? {|l| l.include? value.length})
-        elsif type.name == 'string'
+        elsif type.builtin.name == 'string'
             return (type.patterns.all? {|p| p.match? value} and
                     type.length.any? {|l| l.include? value.length})
         end
@@ -1105,7 +1115,7 @@ def to_json_schema(stm, content_format)
 end
 
 def type2schema(type)
-    case type.name
+    case type.builtin.name
 
     when 'int8', 'int16', 'int32', 'uint8', 'uint16', 'uint32'
         {
@@ -1176,7 +1186,7 @@ def type2schema(type)
         enums = []
         type.deref.map(&:derived_from).reduce(:&).each do |id|
             enums << "#{id.mod}:#{id.name}"
-            enums << id.name if id.mod == type.mod
+            enums << id.name if id.mod == type.source_module
         end
         { :enum => enums }
 

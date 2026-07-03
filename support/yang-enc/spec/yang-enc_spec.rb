@@ -5,7 +5,7 @@ require 'yang-enc'
 
 RSpec.shared_context 'shared test data' do
     let(:alarm_state) {
-        Yang::Universe.new('bits').restrict_bits([
+        Yang::Type.new('bits').restrict_bits([
             Yang::Bit.new('unknown'),
             Yang::Bit.new('under-repair'),
             Yang::Bit.new('critical'),
@@ -17,7 +17,7 @@ RSpec.shared_context 'shared test data' do
     }
 
     let(:oper_status) {
-        Yang::Universe.new('enumeration').restrict_enums([
+        Yang::Type.new('enumeration').restrict_enums([
             Yang::Enum.new('up', 1),
             Yang::Enum.new('down', 2),
             Yang::Enum.new('testing', 3),
@@ -40,7 +40,7 @@ RSpec.shared_context 'shared test data' do
 
         identityref = Yang::Type.new 'identityref'
         identityref.deref = [if_type]
-        identityref.mod = 'ietf-interfaces'
+        identityref.source_module = 'ietf-interfaces'
         identityref
     }
 
@@ -106,14 +106,14 @@ RSpec.describe 'type2cbor' do
 
     context 'inside a union' do
         it 'converts an enumeration value to a string with the tag 44' do
-            enum = Yang::Universe.new('enumeration').restrict_enums([Yang::Enum.new('unbounded')])
+            enum = Yang::Type.new('enumeration').restrict_enums([Yang::Enum.new('unbounded')])
             union = Yang::Type.new('union').add_member(Yang::Type.new 'int32').add_member(enum)
 
             expect(type2cbor(union, 'unbounded')).to eq CBOR::Tagged.new(44, 'unbounded')
         end
 
         it 'converts a bitset to a string with the names of the non-zero bits, tagged with 43' do
-            bits = Yang::Universe.new('bits').restrict_bits([Yang::Bit.new('extra-flag')])
+            bits = Yang::Type.new('bits').restrict_bits([Yang::Bit.new('extra-flag')])
             union = Yang::Type.new('union').add_member(alarm_state).add_member(bits)
 
             expect(type2cbor(union, 'critical under-repair')).to eq CBOR::Tagged.new(43, 'critical under-repair')
@@ -229,7 +229,7 @@ RSpec.describe 'type2json' do
     end
 
     it 'converts a enumeration value to an enum name' do
-        enum = Yang::Universe.new('enumeration').restrict_enums([Yang::Enum.new('unbounded')])
+        enum = Yang::Type.new('enumeration').restrict_enums([Yang::Enum.new('unbounded')])
         union = Yang::Type.new('union').add_member(Yang::Type.new 'int32').add_member(enum)
 
         expect(type2json(union, CBOR::Tagged.new(44, 'unbounded'))).to eq 'unbounded'
@@ -237,7 +237,7 @@ RSpec.describe 'type2json' do
     end
 
     it 'converts a bitset to a string naming the non-zero bits' do
-        bits = Yang::Universe.new('bits').restrict_bits([Yang::Bit.new('extra-flag')])
+        bits = Yang::Type.new('bits').restrict_bits([Yang::Bit.new('extra-flag')])
         union = Yang::Type.new('union').add_member(alarm_state).add_member(bits)
 
         expect(type2json(union, CBOR::Tagged.new(43, 'critical under-repair'))).to eq 'critical under-repair'

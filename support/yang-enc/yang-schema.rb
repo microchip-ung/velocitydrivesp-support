@@ -3,6 +3,8 @@
 # Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
 # SPDX-License-Identifier: MIT
 
+require 'open3'
+require 'yaml'
 require_relative './yang-utils.rb'
 
 def generate_yang_modules(yang_path, yangs, sids)

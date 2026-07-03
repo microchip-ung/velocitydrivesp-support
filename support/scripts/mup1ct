@@ -710,6 +710,7 @@ class Mup1ctApp
     @opt = {}
     @cc_opt = { :keys => [], :flags => [], :datastore => "c" }
     @opt[:checksum_type] = :internet
+    @opt[:baudrate] = 115200
   end
 
   def run(argv)
@@ -763,6 +764,7 @@ class Mup1ctApp
       opts.on("-T", "--trace-timeout SEC", Float, "Wait SEC for traces after command") { |tw| @opt[:Trace] = tw }
       opts.on("-k", "--key FILE.pem", "PEM key file for DTLS (coaps only)") { |k| @opt[:pem_key] = k }
       opts.on("--checksum-type TYPE", [:internet, :crc32], "MUP1 checksum (default: internet)") { |cs| @opt[:checksum_type] = cs }
+      opts.on("--baudrate RATE", Integer, "Serial baud rate (default: 115200)") { |br| @opt[:baudrate] = br }
 
       opts.separator ""
       opts.separator "CoAP/CC options:"
@@ -814,7 +816,7 @@ class Mup1ctApp
     device = get_device
     tracer = Tracer.new(:silent)
 
-    dut = Et::Handler::Dut.new(device)
+    dut = Et::Handler::Dut.new(device, baud: @opt[:baudrate])
 
     # Check if libeasy Mup1 handler supports checksum_type parameter
     mup1_params = Et::Handler::Mup1.instance_method(:initialize).parameters

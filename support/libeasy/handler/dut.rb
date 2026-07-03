@@ -9,7 +9,7 @@ require_relative 'base.rb'
 module Et
   module Handler
     class Dut < Base
-      def initialize uri
+      def initialize uri, baud: 115200
         u = URI(uri)
 
         case u.scheme
@@ -28,7 +28,7 @@ module Et
           require "serialport"
           super "UART"
           conf = {
-            "baud"      => 115200,
+            "baud"      => baud,
             "data_bits" => 8,
             "stop_bits" => 1,
             "parity"    => SerialPort::NONE

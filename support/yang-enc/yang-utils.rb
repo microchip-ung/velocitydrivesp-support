@@ -65,7 +65,7 @@ class ModuleSet
     end
 
     def tsort_each_child node, &block
-      @modules.each_value.select{|c| node.imports? c}.each(&block)
+        @modules.each_value.select{|c| node.imports_module? c.name}.each(&block)
     end
 
     def schema
@@ -112,25 +112,27 @@ end
 
 class Module
     attr_accessor :ast
-    attr_reader :schema, :identity
+    attr_reader :schema, :identity, :name, :prefix, :revision, :import_revisions
 
     def initialize(ast)
         @ast = ast
+        @name = @ast['name']
+        @prefix = @ast.at_css('> prefix')&.[]('value')
+        @revision = @ast.at_css('> revision')&.[]('date')
         @imports = {}
+        @import_revisions = {}
         @ast.css('> import').each do |import|
             import.css('> prefix').each do |p|
                 @imports[p['value']] = import['module']
             end
+            rev = import.at_css('revision-date')
+            @import_revisions[import['module']] = rev&.[]('date')
         end
         @identity = []
     end
 
-    def imports?(other)
-        @imports.values.include? other.name
-    end
-
-    def name
-        @ast['name']
+    def imports_module?(name)
+        @imports.values.include? name
     end
 
     def interpret(modules)
@@ -145,14 +147,6 @@ class Module
             raise "Prefix '#{prefix}' not found in module #{self.name}" if mod_name.nil?
             modules.find_module(mod_name)
         end
-    end
-
-    def prefix
-        @ast.css('> prefix').each do |p|
-            return p['value']
-        end
-
-        return nil
     end
 
     def interpret_stm(stm, modules, groupings = [])
@@ -199,6 +193,7 @@ class Module
             if stm.name == 'choice' and IMPLICIT_CASE_NODES.include? c.name
                 # See RFC 7950 section 7.9.2.
                 implicit_case = stmt.add_child(Statement.new('case', c['name']))
+                implicit_case.add_tag(:implicit_case, true)
                 child = implicit_case.add_child(interpret_stm(c, modules, groupings))
                 # Implicit case statements should have the same "status" as the data node it represents.
                 implicit_case.status = child.status
@@ -306,7 +301,8 @@ class Module
                 target.remove
             when 'replace'
                 deviate.css('> config').each do |config|
-                    target.config = config['value'] == true
+                    target.config = config['value'] == 'true'
+                    target.propagate_config_false if not target.config
                 end
 
                 deviate.css('> type').each do |type|
@@ -320,15 +316,13 @@ class Module
 
     def interpret_type(type, modules)
         if BUILTIN_TYPES.include? type['name']
-            if ['enumeration', 'bits'].include? type['name']
-                t = Universe.new(type['name'])
-            else
-                t = Type.new(type['name'])
-            end
+            t = Type.new(type['name'])
         else
             typedef, src_mod = resolve_typedef(type['name'], type, modules)
-            base = typedef.at_css('> type') # Guaranteed to be present. See RFC 7950 section 7.3.1.
-            t = src_mod.interpret_type(base, modules)
+            base_type_node = typedef.at_css('> type') # Guaranteed to be present. See RFC 7950 section 7.3.1.
+            inner = src_mod.interpret_type(base_type_node, modules)
+            t = inner.derive(typedef['name'])
+            t.defining_module = src_mod.name
             t.description = get_description(typedef)
         end
 
@@ -368,7 +362,7 @@ class Module
         end
 
         type.css('> base').each do |base|
-            t.mod = self.name
+            t.source_module = self.name
             base, src_mod = resolve_identity(base['name'], modules)
             t.deref = [] if t.deref.nil?
             t.deref << src_mod.interpret_identity(base, modules)
@@ -407,7 +401,7 @@ class Module
     end
 
     def resolve_leafref(stm, modules)
-        if stm.type and stm.type.name == 'leafref'
+        if stm.type and stm.type.builtin.name == 'leafref'
             return if stm.type.deref
 
             schema_node, schema_path = leafref_path_to_schema_path(stm, modules)
@@ -642,8 +636,6 @@ class Statement
         end
     end
 
-    protected
-
     def propagate_config_false
         @config = false
 
@@ -654,8 +646,8 @@ class Statement
 end
 
 class Type
-    attr_reader   :fraction_digits, :name
-    attr_accessor :description, :bits, :enums, :members, :path, :deref, :mod, :ranges
+    attr_reader   :fraction_digits, :name, :base
+    attr_accessor :description, :bits, :enums, :members, :path, :deref, :source_module, :ranges, :defining_module
 
     def initialize(name)
         @name = name
@@ -676,6 +668,20 @@ class Type
         @members = other.members.map {|v| v.dup} if other.members
     end
 
+    # Create a derived type from this type.
+    # Uses instance_variable_set because name and base are read-only.
+    def derive(name)
+        t = self.dup
+        t.instance_variable_set(:@name, name)
+        t.instance_variable_set(:@base, self)
+        return t
+    end
+
+    # Walk the base chain to the builtin type (where base is nil)
+    def builtin
+        @base ? @base.builtin : self
+    end
+
     def add_member(type)
         @members = [] if @members.nil?
         @members << type
@@ -694,27 +700,26 @@ class Type
     end
 
     def add_range(range)
-        def interpret_bound(bound)
-            if bound == 'max'
-                @ranges.max_by {|r| r.max}.max
-            elsif bound == 'min'
-                @ranges.min_by {|r| r.min}.min
-            elsif @name == 'decimal64'
-                BigDecimal(bound)
-            elsif @name =~ /u?int\d{1,2}/
-                Integer(bound)
-            elsif ['string', 'binary'].include? @name
-                Integer(bound)
-            end
-        end
-
-        @ranges = range.split('|').map do |range|
-            min, max = range.split('..').map(&:strip)
+        @ranges = range.split('|').map do |r|
+            min, max = r.split('..').map(&:strip)
             max = min if max.nil?
-            Range.new(interpret_bound(min), interpret_bound(max))
+            Range.new(interpret_range_bound(min), interpret_range_bound(max))
         end
-
         return self
+    end
+
+    def interpret_range_bound(bound)
+        if bound == 'max'
+            @ranges.max_by {|r| r.max}.max
+        elsif bound == 'min'
+            @ranges.min_by {|r| r.min}.min
+        elsif builtin.name == 'decimal64'
+            BigDecimal(bound)
+        elsif builtin.name =~ /u?int\d{1,2}/
+            Integer(bound)
+        elsif ['string', 'binary'].include? builtin.name
+            Integer(bound)
+        end
     end
 
     def add_length(length)
@@ -726,7 +731,7 @@ class Type
     end
 
     def set_fraction_digits(fraction_digits)
-        return self if @name != 'decimal64'
+        return self if builtin.name != 'decimal64'
         @fraction_digits = fraction_digits
         min = BigDecimal("-9223372036854775808") / (10 ** fraction_digits)
         max = BigDecimal("9223372036854775807") / (10 ** fraction_digits)
@@ -735,23 +740,36 @@ class Type
     end
 
     def restrict_bits(bits)
-        return self if @name != 'bits'
+        return self if builtin.name != 'bits'
 
-        t = Type.new(@name)
+        t = self.derive(@name)
         t.bits = {}
 
-        bits.each do |b|
-            if @bits[b.name]
-                if b.position == @bits[b.name].position
-                    t.bits[b.name] = b
-                elsif b.position.nil?
-                    b.position = @bits[b.name].position
-                    t.bits[b.name] = b
-                else
-                    raise "Invalid bit restriction, bit #{b.name} has changed position from #{@bits[b.name].position} to #{b.position}"
+        if @base.nil?
+            # Deriving from the universe: auto-assign positions
+            bits.each do |bit|
+                if bit.position.nil?
+                    bit.position = 0
+                    _, b = t.bits.max_by {|_, b| b.position}
+                    bit.position = b.position + 1 if b
                 end
-            else
-                raise "Invalid bit restriction, bit #{b.name} doesn't exist in base type"
+                t.bits[bit.name] = bit
+            end
+        else
+            # Restricting an existing type: subset only
+            bits.each do |b|
+                if @bits[b.name]
+                    if b.position == @bits[b.name].position
+                        t.bits[b.name] = b
+                    elsif b.position.nil?
+                        b.position = @bits[b.name].position
+                        t.bits[b.name] = b
+                    else
+                        raise "Bit #{b.name} has changed position from #{@bits[b.name].position} to #{b.position}"
+                    end
+                else
+                    raise "Bit #{b.name} doesn't exist in base type"
+                end
             end
         end
 
@@ -759,64 +777,37 @@ class Type
     end
 
     def restrict_enums(enums)
-        return self if @name != 'enumeration'
+        return self if builtin.name != 'enumeration'
 
-        t = Type.new(@name)
+        t = self.derive(@name)
         t.enums = {}
 
-        enums.each do |e|
-            if @enums[e.name]
-                if e.value == @enums[e.name].value
-                    t.enums[e.name] = e
-                elsif e.value.nil?
-                    e.value = @enums[b.name].value
-                    t.enums[e.name] = e
-                else
-                    raise "Invalid enum restriction, enum #{e.name} has changed value from #{@enums[e.name].value} to #{e.value}"
+        if @base.nil?
+            # Deriving from the universe: auto-assign values
+            enums.each do |enum|
+                if enum.value.nil?
+                    enum.value = 0
+                    _, e = t.enums.max_by {|_, e| e.value}
+                    enum.value = e.value + 1 if e
                 end
-            else
-                raise "Invalid enum restriction, enum #{e.name} doesn't exist in base type"
+                t.enums[enum.name] = enum
             end
-        end
-
-        return t
-    end
-end
-
-class Universe < Type
-    def restrict_enums(enums)
-        return self if @name != 'enumeration'
-
-        t = Type.new(@name)
-        t.enums = {}
-
-        enums.each do |enum|
-            if enum.value.nil?
-                enum.value = 0
-                _, e = t.enums.max_by {|_, e| e.value}
-                enum.value = e.value + 1 if e
+        else
+            # Restricting an existing type: subset only
+            enums.each do |e|
+                if @enums[e.name]
+                    if e.value == @enums[e.name].value
+                        t.enums[e.name] = e
+                    elsif e.value.nil?
+                        e.value = @enums[e.name].value
+                        t.enums[e.name] = e
+                    else
+                        raise "Enum #{e.name} has changed value from #{@enums[e.name].value} to #{e.value}"
+                    end
+                else
+                    raise "Enum #{e.name} doesn't exist in base type"
+                end
             end
-
-            t.enums[enum.name] = enum
-        end
-
-        return t
-    end
-
-    def restrict_bits(bits)
-        return self if @name != 'bits'
-
-        t = Type.new(@name)
-        t.bits = {}
-
-        bits.each do |bit|
-            if bit.position.nil?
-                bit.position = 0
-                _, b = t.bits.max_by {|_, b| b.position}
-                bit.position = b.position + 1 if b
-            end
-
-            t.bits[bit.name] = bit
         end
 
         return t

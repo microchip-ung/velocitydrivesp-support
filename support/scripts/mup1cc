@@ -354,6 +354,7 @@ $opts = {:continue_on_error => false,
          :device => get_device,
          :query => [],
          :checksum_type => :internet,
+         :baudrate => 115200,
         } # Add more default options here
 
 OptionParser.new do |opts|
@@ -383,6 +384,11 @@ OptionParser.new do |opts|
             "MUP1 checksum type: internet-checksum (default) or crc32") do |o|
         # Map CLI argument to internal symbol (internet-checksum -> :internet)
         $opts[:checksum_type] = (o == "internet-checksum") ? :internet : :crc32
+    end
+
+    opts.on("--baudrate RATE", Integer,
+            "Serial baud rate (default: 115200)") do |o|
+        $opts[:baudrate] = o
     end
 
     opts.on("-m", "--method fetch|ipatch|get|put|post|delete", ["fetch", "ipatch", "get", "put", "post", "delete"],
@@ -472,7 +478,7 @@ raise "Missing method!" if $opts[:method].nil? and $opts[:log_run].nil?
 # Initialize handler
 ################################################################################
 tracer = Tracer.new $opts[:sys_trace]
-dut = Et::Handler::Dut.new $opts[:device]
+dut = Et::Handler::Dut.new $opts[:device], baud: $opts[:baudrate]
 m = Et::Handler::Mup1.new dut, tracer, true, $opts[:checksum_type]
 mon = Mup1Con.new m
 if $opts[:key] != nil
