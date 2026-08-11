@@ -167,3 +167,87 @@ non-public upstream repository. This means that pull-requests are not accepted,
 and the git-log is not really use full as it is mostly just "import-commits"
 where the support-folder is copied from the upstream repo to this.
 
+
+= Updating the Docker image
+
+This section is for maintainers of this repository. Users of the scripts do not
+need any of it - `dr` pulls the published image automatically.
+
+IMPORTANT: Everything below `support/` in this repository is overwritten by the
+export from the upstream repository - the export script starts by doing a
+`rm -rf` of `support/`. Changes to the Dockerfile must therefore be made in the
+upstream repository, never here, or they will be silently lost on the next
+import. The files outside `support/` (`.docker.env`, `dr`, `LICENSE` and this
+README) are maintained in this repository and are not touched by the export.
+
+== Prerequisites
+
+- A working `docker` installation, and membership of the `docker` group.
+- A checkout of the upstream repository, which holds both the Dockerfile and
+  the `support/scripts/update-support-repo` export script.
+- A GitHub *classic* personal access token with the `write:packages` scope, and
+  permission to write packages in the `microchip-ung` organisation.
+  Fine-grained tokens cannot write packages. Export it as `CR_PAT`.
+
+In the steps below, `<N>` is the new tag and `<upstream>` is the path to the
+upstream checkout.
+
+== 1. Build the image
+
+The build context must be `support/docker`, because the Dockerfile does a
+`COPY ./entrypoint.sh`:
+
+    $ cd <upstream>
+    $ docker build \
+        -f support/docker/support.Dockerfile \
+        -t ghcr.io/microchip-ung/velocitydrivesp-support:<N> \
+        support/docker
+
+== 2. Update the tag in `.docker.env`
+
+== 3. Verify the image
+
+Test that mup1cc, mup1ct, dbgreg etc. are working inside `dr`.
+
+== 4. Log in to GHCR
+
+A GitHub password is not accepted here, only a token:
+
+    $ echo "$CR_PAT" | docker login ghcr.io \
+        -u <github-username> --password-stdin
+
+== 5. Push the image
+
+    $ docker push ghcr.io/microchip-ung/velocitydrivesp-support:<N>
+
+The package already exists and is public, so a new tag inherits that
+visibility. Changing the visibility is only needed when a package is created
+for the first time, because GHCR makes new packages private by default.
+
+== 6. Import the scripts and commit
+
+Run the export directly into this repository, so that the new image and the
+scripts it was verified against are published together:
+
+    $ cd <upstream>
+    $ ./support/scripts/update-support-repo -o <path-to-this-repo> -v
+
+Then commit the `.docker.env` bump together with the imported files, using the
+usual import-commit subject and the upstream revision that was exported:
+
+    $ cd <path-to-this-repo>
+    $ git add -A
+    $ git commit -m "Import ./support from upstream repo rev: <upstream-sha>"
+    $ git push
+
+== 7. Check that it works from a clean state
+
+Finally, confirm that a user starting from scratch gets the new image:
+
+    $ docker rmi ghcr.io/microchip-ung/velocitydrivesp-support:<N>
+    $ cd <path-to-this-repo>
+    $ dr mup1cc --help
+
+This pulls the image from GHCR through `.docker.env`, which verifies both that
+the push succeeded and that the image is publicly readable.
+
