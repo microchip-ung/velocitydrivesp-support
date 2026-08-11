@@ -1,0 +1,100 @@
+Will mark unstable allocations finalized
+WARNING: Module 'ietf-yang-types' imported without revision, using latest revision 2013-07-15
+WARNING: Module 'ietf-inet-types' imported without revision, using latest revision 2013-07-15
+WARNING: Module 'ietf-netconf-acm' imported without revision, using latest revision 2018-02-14
+WARNING: Module 'iana-crypt-hash' imported without revision, using latest revision 2014-08-06
+Finalizing unstable allocations to 2014-08-06
+  finalized ietf-system
+  finalized authentication-method
+  finalized local-users
+  finalized radius
+  finalized radius-authentication-type
+  finalized radius-chap
+  finalized radius-pap
+  finalized authentication
+  finalized dns-udp-tcp-port
+  finalized local-users
+  finalized ntp
+  finalized ntp-udp-port
+  finalized radius
+  finalized radius-authentication
+  finalized timezone-name
+  finalized /ietf-system:set-current-datetime
+  finalized /ietf-system:set-current-datetime/input
+  finalized /ietf-system:set-current-datetime/input/current-datetime
+  finalized /ietf-system:set-current-datetime/output
+  finalized /ietf-system:system
+  finalized /ietf-system:system-restart
+  finalized /ietf-system:system-restart/input
+  finalized /ietf-system:system-restart/output
+  finalized /ietf-system:system-shutdown
+  finalized /ietf-system:system-shutdown/input
+  finalized /ietf-system:system-shutdown/output
+  finalized /ietf-system:system-state
+  finalized /ietf-system:system-state/clock
+  finalized /ietf-system:system-state/clock/boot-datetime
+  finalized /ietf-system:system-state/clock/current-datetime
+  finalized /ietf-system:system-state/platform
+  finalized /ietf-system:system-state/platform/machine
+  finalized /ietf-system:system-state/platform/os-name
+  finalized /ietf-system:system-state/platform/os-release
+  finalized /ietf-system:system-state/platform/os-version
+  finalized /ietf-system:system/authentication
+  finalized /ietf-system:system/authentication/user
+  finalized /ietf-system:system/authentication/user-authentication-order
+  finalized /ietf-system:system/authentication/user/authorized-key
+  finalized /ietf-system:system/authentication/user/authorized-key/algorithm
+  finalized /ietf-system:system/authentication/user/authorized-key/key-data
+  finalized /ietf-system:system/authentication/user/authorized-key/name
+  finalized /ietf-system:system/authentication/user/name
+  finalized /ietf-system:system/authentication/user/password
+  finalized /ietf-system:system/clock
+  finalized /ietf-system:system/clock/timezone
+  finalized /ietf-system:system/clock/timezone/timezone-name
+  finalized /ietf-system:system/clock/timezone/timezone-name/timezone-name
+  finalized /ietf-system:system/clock/timezone/timezone-utc-offset
+  finalized /ietf-system:system/clock/timezone/timezone-utc-offset/timezone-utc-offset
+  finalized /ietf-system:system/contact
+  finalized /ietf-system:system/dns-resolver
+  finalized /ietf-system:system/dns-resolver/options
+  finalized /ietf-system:system/dns-resolver/options/attempts
+  finalized /ietf-system:system/dns-resolver/options/timeout
+  finalized /ietf-system:system/dns-resolver/search
+  finalized /ietf-system:system/dns-resolver/server
+  finalized /ietf-system:system/dns-resolver/server/name
+  finalized /ietf-system:system/dns-resolver/server/transport
+  finalized /ietf-system:system/dns-resolver/server/transport/udp-and-tcp
+  finalized /ietf-system:system/dns-resolver/server/transport/udp-and-tcp/udp-and-tcp
+  finalized /ietf-system:system/dns-resolver/server/transport/udp-and-tcp/udp-and-tcp/address
+  finalized /ietf-system:system/dns-resolver/server/transport/udp-and-tcp/udp-and-tcp/port
+  finalized /ietf-system:system/hostname
+  finalized /ietf-system:system/location
+  finalized /ietf-system:system/ntp
+  finalized /ietf-system:system/ntp/enabled
+  finalized /ietf-system:system/ntp/server
+  finalized /ietf-system:system/ntp/server/association-type
+  finalized /ietf-system:system/ntp/server/iburst
+  finalized /ietf-system:system/ntp/server/name
+  finalized /ietf-system:system/ntp/server/prefer
+  finalized /ietf-system:system/ntp/server/transport
+  finalized /ietf-system:system/ntp/server/transport/udp
+  finalized /ietf-system:system/ntp/server/transport/udp/udp
+  finalized /ietf-system:system/ntp/server/transport/udp/udp/address
+  finalized /ietf-system:system/ntp/server/transport/udp/udp/port
+  finalized /ietf-system:system/radius
+  finalized /ietf-system:system/radius/options
+  finalized /ietf-system:system/radius/options/attempts
+  finalized /ietf-system:system/radius/options/timeout
+  finalized /ietf-system:system/radius/server
+  finalized /ietf-system:system/radius/server/authentication-type
+  finalized /ietf-system:system/radius/server/name
+  finalized /ietf-system:system/radius/server/transport
+  finalized /ietf-system:system/radius/server/transport/udp
+  finalized /ietf-system:system/radius/server/transport/udp/udp
+  finalized /ietf-system:system/radius/server/transport/udp/udp/address
+  finalized /ietf-system:system/radius/server/transport/udp/udp/authentication-port
+  finalized /ietf-system:system/radius/server/transport/udp/udp/shared-secret
+
+File ietf-system@2014-08-06.sid created
+Number of SIDs available : 100
+Number of SIDs used : 90

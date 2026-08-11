@@ -583,22 +583,37 @@ def chk_mandatory(old, new, ctx):
             err_def_changed(oldmandatory, newmandatory, ctx)
 
 def chk_min_max(old, new, ctx):
+    # RFC 7950: 'min-elements' defaults to 0 and 'max-elements' defaults to
+    # 'unbounded', so an absent statement is equivalent to that default.  Fold
+    # the defaults into the comparison so that e.g. an added 'max-elements
+    # unbounded' (which equals the default) is not flagged as a restriction.
     oldmin = old.search_one('min-elements')
     newmin = new.search_one('min-elements')
     if newmin is None:
         pass
     elif oldmin is None:
-        err_def_added(newmin, ctx)
-    elif int(newmin.arg) > int(oldmin.arg):
+        if _min_elements_val(newmin.arg) > 0:
+            err_def_added(newmin, ctx)
+    elif _min_elements_val(newmin.arg) > _min_elements_val(oldmin.arg):
         err_def_changed(oldmin, newmin, ctx)
     oldmax = old.search_one('max-elements')
     newmax = new.search_one('max-elements')
     if newmax is None:
         pass
     elif oldmax is None:
-        err_def_added(newmax, ctx)
-    elif int(newmax.arg) < int(oldmax.arg):
+        if _max_elements_val(newmax.arg) < float('inf'):
+            err_def_added(newmax, ctx)
+    elif _max_elements_val(newmax.arg) < _max_elements_val(oldmax.arg):
         err_def_changed(oldmax, newmax, ctx)
+
+def _min_elements_val(arg):
+    # default for min-elements is 0 (RFC 7950 7.7.5)
+    return int(arg)
+
+def _max_elements_val(arg):
+    # 'unbounded' is a valid value for max-elements (RFC 7950 7.7.4) and
+    # represents no upper bound, i.e. positive infinity.
+    return float('inf') if arg == 'unbounded' else int(arg)
 
 def chk_presence(old, new, ctx):
     oldpresence = old.search_one('presence')
@@ -649,6 +664,22 @@ def chk_unique(old, new, ctx):
         else:
             err_def_added(u, ctx)
 
+def chk_ordered_by(old, new, ctx):
+    oldorderedby = old.search_one('ordered-by')
+    neworderedby = new.search_one('ordered-by')
+    if oldorderedby is None and neworderedby is None:
+        pass
+    elif oldorderedby is None and neworderedby is not None and \
+         neworderedby.arg == 'user':
+        err_def_added(neworderedby, ctx)
+    elif oldorderedby is not None and neworderedby is None and \
+         oldorderedby.arg == 'user':
+        err_def_removed(oldorderedby, new, ctx)
+    elif oldorderedby is not None and neworderedby is not None and \
+         oldorderedby.arg != neworderedby.arg:
+        err_add(ctx.errors, neworderedby.pos, 'CHK_DEF_CHANGED',
+                ('ordered-by', neworderedby.arg, oldorderedby.arg))
+
 def chk_leaf(old, new, ctx):
     chk_type(old.search_one('type'), new.search_one('type'), ctx)
     chk_units(old, new, ctx)
@@ -659,6 +690,7 @@ def chk_leaf_list(old, new, ctx):
     chk_type(old.search_one('type'), new.search_one('type'), ctx)
     chk_units(old, new, ctx)
     chk_min_max(old, new, ctx)
+    chk_ordered_by(old, new, ctx)
 
 def chk_container(old, new, ctx):
     chk_presence(old, new, ctx)
@@ -669,6 +701,7 @@ def chk_list(old, new, ctx):
     chk_key(old, new, ctx)
     chk_unique(old, new, ctx)
     chk_i_children(old, new, ctx)
+    chk_ordered_by(old, new, ctx)
 
 def chk_choice(old, new, ctx):
     chk_mandatory(old, new, ctx)

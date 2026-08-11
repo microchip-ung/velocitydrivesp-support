@@ -37,6 +37,7 @@ def main
     input_format = 'yaml'
     output_format = 'cbor'
     content_format = 'yang'
+    continue_on_error = false
 
     conv_parser = OptionParser.new do |opts|
         opts.banner = """Usage: yang-enc conv [options] [<data file>] [<sid files> <yang files>]
@@ -63,6 +64,10 @@ If no sid and yang files, the default schema is used.
                 "put:    Content is a PUT request (alias for yang).",
                 "post:   Content is a POST request or response (for RPCs and actions) .") do |c|
             content_format = c
+        end
+
+        opts.on("", "--continue-on-error", "Continue processing on schema validation error") do
+            continue_on_error = true
         end
 
         opts.on("-h", "--help", "Show this message") do
@@ -142,7 +147,7 @@ If no yang files, the default schema is used.
 
         when ['json', 'cbor'], ['yaml', 'cbor']
             STDOUT.binmode
-            STDOUT.write(json_seq2cbor(schema, input_data, content_format))
+            STDOUT.write(json_seq2cbor(schema, input_data, content_format, continue_on_error))
 
         when ['cbor', 'json']
             puts JSON.pretty_generate(cbor_seq2json(schema, input_data, content_format))

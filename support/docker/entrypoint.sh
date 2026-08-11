@@ -28,6 +28,13 @@ if [[ -z $BLD_UID ]]; then
     BLD_ID=1000
 fi
 
+# When invoked through the "dr" script the real name of the caller is passed
+# in BLD_GECOS. In CI (e.g. Jenkins) it is typically unset, so fall back to a
+# placeholder.
+if [[ -z $BLD_GECOS ]]; then
+    BLD_GECOS="Bob the Builder"
+fi
+
 # Jenkins uses the pre-created user
 if [[ "$BLD_USER" != "jenkins" ]]; then
     deluser jenkins > /dev/null 2> /dev/null
@@ -35,7 +42,26 @@ fi
 
 if [[ "$BLD_USER" != "root" ]]; then
     # Add user as specified in environment
-    adduser --no-create-home --disabled-password --home /mapped_home --uid $BLD_UID --gecos "Bob the Builder" $BLD_USER > /dev/null
+    adduser --no-create-home --disabled-password --home /mapped_home --uid $BLD_UID --gecos "$BLD_GECOS" $BLD_USER > /dev/null
+
+    # The UART devices are passed in with their host group preserved (often
+    # uucp or dialout), and the kernel checks the numeric gid for access. For
+    # each owning gid we make sure a group with that gid exists and add the
+    # user to it, so it can access the mapped devices.
+    for gid in $BLD_DEV_GIDS; do
+        # Skip gid 0 (root) and gids the user already covers as its own group.
+        if [[ "$gid" == "0" || "$gid" == "$BLD_UID" ]]; then
+            continue
+        fi
+
+        grp=$(getent group "$gid" | cut -d: -f1)
+        if [[ -z "$grp" ]]; then
+            grp="dev_$gid"
+            addgroup --gid "$gid" "$grp" > /dev/null 2> /dev/null
+        fi
+
+        adduser "$BLD_USER" "$grp" > /dev/null 2> /dev/null
+    done
 fi
 
 # Allow user to sudo without password

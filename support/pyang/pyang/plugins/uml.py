@@ -236,7 +236,7 @@ class uml_emitter:
         self.ctx_title = not "title" in no
         self.ctx_footer = not "footer" in no
 
-        nostrings = ("module", "leafref", "uses", "annotation", "identityref", "typedef", "import", "circles", "stereotypes", "prefix", "footer", "title")
+        nostrings = ("module", "uses", "leafref", "identity", "identityref", "typedef", "import", "annotation", "circles", "stereotypes", "prefix", "footer", "title")
         if ctx.opts.uml_no != "":
             for no_opt in no:
                 if no_opt not in nostrings:
@@ -422,6 +422,9 @@ class uml_emitter:
         elif stmt.keyword == 'grouping' and not self._ctx.opts.uml_inline:
             self.emit_grouping(mod, stmt, fd, True)
 
+        elif stmt.keyword == 'uses':
+            self.emit_child_stmt(mod, stmt, fd)
+
         elif stmt.keyword == 'choice':
             if not self.ctx_filterfile:
                 fd.write('class \"%s\" as %s <<choice>> \n' % (self.full_display_path(stmt), self.full_path(stmt)))
@@ -463,8 +466,12 @@ class uml_emitter:
             # for s in stmt.substmts:
               # emit_stmt(mod, s, fd)
 
+    def emit_augmented_children(self, node, fd, augmented = True):
+        if augmented:
+            for children in [ch for ch in node.i_children if hasattr(ch, 'i_augment') and ch not in node.substmts]:
+                self.emit_child_stmt(node, children, fd)
 
-    def emit_child_stmt(self, parent, node, fd, cont = True):
+    def emit_child_stmt(self, parent, node, fd, cont = True, augmented = False):
         keysign = ''
         keyprefix = ''
         uniquesign = ''
@@ -484,6 +491,7 @@ class uml_emitter:
             if cont:
                 for children in node.substmts:
                     self.emit_child_stmt(node, children, fd)
+                self.emit_augmented_children(node, fd, augmented)
         elif node.keyword == 'grouping' and not self._ctx.opts.uml_inline:
             self.emit_grouping(parent, node, fd)
 
@@ -492,6 +500,7 @@ class uml_emitter:
             if cont:
                 for children in node.substmts:
                     self.emit_child_stmt(node, children, fd)
+                self.emit_augmented_children(node, fd, augmented)
 
         elif node.keyword == 'choice':
             if not self.ctx_filterfile:
@@ -512,7 +521,7 @@ class uml_emitter:
                 for children in node.substmts:
                     self.emit_child_stmt(node, children, fd)
         elif node.keyword == 'uses':
-            if not self.ctx_filterfile and not self._ctx.opts.uml_inline:
+            if not self.ctx_filterfile and not self._ctx.opts.uml_inline and not self.ctx_classesonly:
                 fd.write('%s : %s {uses} \n' %(self.full_path(parent), node.arg))
             if not self._ctx.opts.uml_inline:
                 self.emit_uses(parent, node)
@@ -521,10 +530,11 @@ class uml_emitter:
                 if grouping_node is not None:
                     # inline grouping here
                     # sys.stderr.write('Found  target grouping to inline %s %s \n' %(grouping_node.keyword, grouping_node.arg))
-                    for children in grouping_node.substmts:
-                        # make the inlined parent to parent rather then the grouping to make full path unique
-                        children.parent = parent
-                        self.emit_child_stmt(parent, children, fd)
+                    targets = [s.i_target_node for s in node.substmts if s.keyword == 'augment']
+                    children = [ch for ch in parent.i_children if hasattr(ch, 'i_uses') and node in ch.i_uses]
+                    for child in children:
+                        child.parent = parent
+                        self.emit_child_stmt(parent, child, fd, True, child in targets)
 
         # moved stuff below here in order to include annotations for classes-only
         elif node.keyword == 'description' and self.ctx_description:

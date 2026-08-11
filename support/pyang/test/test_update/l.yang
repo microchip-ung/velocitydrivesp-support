@@ -1,0 +1,35 @@
+module l {
+  namespace urn:l;
+  prefix l;
+
+  revision 2014-03-01;
+
+  list a {
+    key id;
+    max-elements unbounded;
+    leaf id { type uint32; }
+  }
+  list b {
+    key id;
+    max-elements 5;
+    leaf id { type uint32; }
+  }
+  list c {
+    key id;
+    max-elements unbounded;
+    leaf id { type uint32; }
+  }
+  list d {
+    key id;
+    leaf id { type uint32; }
+  }
+  list e {
+    key id;
+    max-elements 5;
+    leaf id { type uint32; }
+  }
+  list f {
+    key id;
+    leaf id { type uint32; }
+  }
+}

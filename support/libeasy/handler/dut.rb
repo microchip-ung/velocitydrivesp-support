@@ -90,6 +90,20 @@ module Et
       def timeout_work
       end
 
+      # Discard pending RX without dispatching it to the protocol handlers,
+      # draining until the link is idle for +idle+ seconds.
+      def flush_rx idle = 0.1
+        loop do
+          res = IO.select([@socket], [], [], idle)
+          break if res.nil?
+          begin
+            break if @socket.read_nonblock(4096).empty?
+          rescue IO::WaitReadable, EOFError
+            break
+          end
+        end
+      end
+
       def tx data
         @socket.write data
       end

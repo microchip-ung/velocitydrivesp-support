@@ -1,0 +1,27 @@
+{
+  "ietf-sid-file:sid-file": {
+    "module-name": "k",
+    "sid-file-status": "unpublished",
+    "description": "pyang description",
+    "dependency-revision": [
+      {
+        "module-name": "j",
+        "module-revision": "2025-07-15"
+      }
+    ],
+    "assignment-range": [
+      {
+        "entry-point": "300",
+        "size": "10"
+      }
+    ],
+    "item": [
+      {
+        "namespace": "module",
+        "identifier": "k",
+        "status": "unstable",
+        "sid": "300"
+      }
+    ]
+  }
+}

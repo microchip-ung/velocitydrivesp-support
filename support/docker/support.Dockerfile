@@ -1,7 +1,7 @@
 # Copyright (c) 2021-2022 Microchip Technology Inc. and its subsidiaries.
 # SPDX-License-Identifier: MIT
 
-FROM ubuntu:jammy-20240405 AS velocitydrivesp_support
+FROM ubuntu:plucky-20241213 AS velocitydrivesp_support
 ENV TZ=Europe/Copenhagen
 
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
@@ -9,6 +9,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
   && apt-get update \
   && apt-get upgrade -y \
   && apt-get install -y \
+  bsdmainutils \
   build-essential \
   ca-certificates \
   curl \
@@ -33,7 +34,8 @@ RUN locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8 LANGUAGE=en
 ENV LANG='en_US.UTF-8' LC_ALL='en_US.UTF-8' LANGUAGE=en
 
 # Ruby gems
-RUN gem install nokogiri cbor-diag bit-struct packetfu tar json_schemer serialport
+RUN gem install nokogiri cbor-diag bit-struct packetfu tar json_schemer
+RUN gem install serialport -- --with-cflags="-Wno-deprecated-declarations -Wno-int-conversion"
 
 # Install rust utils
 ENV CARGO_HOME='/usr/cargo'
@@ -44,6 +46,7 @@ RUN /usr/cargo/bin/cargo install --root /usr cargo-trim && \
 
 # Create a default user for Jenkins, as jenkins does not use the entry-point to
 # change user.
+RUN deluser ubuntu
 RUN adduser --no-create-home --disabled-password --home /mapped_home --uid 1000 --gecos "Bob the Builder" jenkins > /dev/null
 
 RUN apt-get install -y python3 python3-pip
