@@ -82,6 +82,7 @@ def main
   when :only_check
     valid = true
     errmsg = schemer.validate(bc).map{|e| JSONSchemer::Errors.pretty(e)}
+    errmsg += validate_fs(bc)
     if errmsg.size == 0
       puts "Schema check: Passed"
     else
@@ -90,10 +91,77 @@ def main
     end
 
   else
+    fs_errors = validate_fs(bc)
+    if fs_errors.size > 0
+      STDERR.puts "Board config file-system check: Failed"
+      STDERR.puts fs_errors.map{|e| "  #{e}"}.join("\n")
+      exit 1
+    end
     bc_cbor = json_seq2cbor(bc_schema, bc, 'yang')
     STDOUT.binmode
     STDOUT.write(bc_cbor)
   end
+end
+
+# Flash geometry. Not in the board config -- it comes from the SPI-NOR driver at
+# runtime (os/drivers/src/flash/lmd_spi_nor.c: erase_size 4*1024, page_size 256).
+# Kept here as constants so the file-system layout can be checked at build time
+# instead of failing on the board. If a target ever uses a part with different
+# geometry, these have to follow it.
+FS_ERASE_SIZE = 4 * 1024
+FS_PAGE_SIZE  = 256
+
+# Pages the file header occupies: the stamp page and the encryption-header page.
+# Must match FS_HDR_PAGES in os/drivers/src/fs/lmd_fs.c.
+FS_HDR_PAGES = 2
+
+# Check the board:fs file table the same way lmd_fs/lmo_init check it on the
+# board, so a bad layout fails the build instead of the target.
+def validate_fs bc
+  # The fs table lives under board:drivers, not at the top level.
+  files = bc.dig("board:drivers", "fs", "files")
+  return [] if files.nil?   # a target without a file system is fine
+
+  errors = []
+  hdr = FS_HDR_PAGES * FS_PAGE_SIZE
+
+  files.each do |f|
+    type, offset, size = f["type"], f["offset"], f["max_size"]
+
+    # A file starts on an erase-block boundary; lmo_init.c rejects anything else.
+    if offset.nil? || (offset % FS_ERASE_SIZE) != 0
+      errors << "fs type '#{type}': offset #{offset} is not a multiple of the " \
+                "erase size #{FS_ERASE_SIZE}"
+    end
+
+    # A region is deleted a whole erase block at a time, so it must be a whole,
+    # non-zero number of blocks -- otherwise a delete disturbs its neighbour.
+    if size.nil? || size < FS_ERASE_SIZE || (size % FS_ERASE_SIZE) != 0
+      errors << "fs type '#{type}': max_size #{size} is not a non-zero " \
+                "multiple of the erase size #{FS_ERASE_SIZE}"
+    end
+
+    # max_size covers the header too, so a region this small holds no payload.
+    if !size.nil? && size <= hdr
+      errors << "fs type '#{type}': max_size #{size} leaves no room for data " \
+                "after the #{hdr}-byte header"
+    end
+  end
+
+  # Regions must not overlap: a write bounded by its own region would still
+  # corrupt a neighbour that starts inside it.
+  files.combination(2).each do |a, b|
+    next if a["offset"].nil? || b["offset"].nil?
+    next if a["max_size"].nil? || b["max_size"].nil?
+    a_end = a["offset"] + a["max_size"]
+    b_end = b["offset"] + b["max_size"]
+    if a["offset"] < b_end && b["offset"] < a_end
+      errors << "fs types '#{a["type"]}' [#{a["offset"]}, #{a_end}) and " \
+                "'#{b["type"]}' [#{b["offset"]}, #{b_end}) overlap"
+    end
+  end
+
+  errors
 end
 
 def merge_hashes a, b

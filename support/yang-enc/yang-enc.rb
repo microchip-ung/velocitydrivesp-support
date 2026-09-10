@@ -875,6 +875,15 @@ def type2json(type, value, continue_on_error = false)
         when 'enumeration'
             return value.value if value.is_a? CBOR::Tagged
             _, enum = type.enums.find {|_, enum| enum.value == value}
+            # The DUT can report an enum ordinal this YANG model does not define
+            # -- e.g. a capability added to lm_os_cap_t but not yet mirrored into
+            # the enum. Decode to the raw ordinal and warn, instead of crashing
+            # on nil.name, so the FETCH still returns and the caller sees it.
+            if enum.nil?
+                STDERR.puts "yang-enc: unknown enumeration ordinal #{value}; " \
+                            "decoding as raw value (YANG model behind firmware?)"
+                return value
+            end
             enum.name
 
         when 'bits'

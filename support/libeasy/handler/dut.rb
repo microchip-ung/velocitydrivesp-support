@@ -104,6 +104,28 @@ module Et
         end
       end
 
+      # Like flush_rx, but RETURNS the drained bytes instead of discarding them
+      # (for diagnostics). Reads pending RX straight off the socket, without
+      # dispatching to the protocol handlers, until the link is idle for +idle+
+      # seconds or +max_bytes+ have been collected. Used on the failure path to
+      # capture whatever the board is still emitting on the UART.
+      def drain_raw idle = 0.3, max_bytes = 8192
+        buf = "".b
+        loop do
+          res = IO.select([@socket], [], [], idle)
+          break if res.nil?
+          begin
+            chunk = @socket.read_nonblock(4096)
+            break if chunk.empty?
+            buf << chunk
+            break if buf.bytesize >= max_bytes
+          rescue IO::WaitReadable, EOFError
+            break
+          end
+        end
+        buf
+      end
+
       def tx data
         @socket.write data
       end

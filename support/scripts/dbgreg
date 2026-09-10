@@ -92,7 +92,7 @@ if $cmd == "miim"
              Integer($2, exception: false),
              Integer($3, exception: false)]
       raise "Did not understand: #{a}" if res.include? nil
-      req << { :port => res[0], :reg => res[2],
+      req << { :port => res[0], :reg => res[1],
                :val => res[2], :clause => clause }
 
     when /^(\w+):(\w+):(\w+)$/
