@@ -173,12 +173,16 @@ if $cmd == "miim"
             str += ("0x%04X  " % (r & 0xffff))
         end
         v = a[3]
-        16.times do |i|
-            str += "." if ((i > 0) && (i % 8) == 0)
-            str += (((1 << (15 - i)) & v) > 0 ? "1" : "0")
+        if v.nil?
+            str += "ERROR"
+        else
+            16.times do |i|
+                str += "." if ((i > 0) && (i % 8) == 0)
+                str += (((1 << (15 - i)) & v) > 0 ? "1" : "0")
+            end
+            str += ("  0x%04X" % v)
+            str += "  #{v}"
         end
-        str += ("  0x%04X" % v)
-        str += "  #{v}"
         if (idx == 0)
             puts ""
             hdr.length.times do
@@ -257,12 +261,16 @@ else
         str += "    "
         str += ("0x%08X  " % a[1])
         v = a[2]
-        32.times do |i|
-            str += "." if ((i > 0) && (i % 8) == 0)
-            str += (((1 << (31 - i)) & v) > 0 ? "1" : "0")
+        if v.nil?
+            str += "ERROR"
+        else
+            32.times do |i|
+                str += "." if ((i > 0) && (i % 8) == 0)
+                str += (((1 << (31 - i)) & v) > 0 ? "1" : "0")
+            end
+            str += ("  0x%08X" % v)
+            str += "  #{v}"
         end
-        str += ("  0x%08X" % v)
-        str += "  #{v}"
         puts str
     end
   rescue
