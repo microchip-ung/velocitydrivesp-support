@@ -272,7 +272,7 @@ module Et
         end
 
         if @token
-          s += " Token=0x%02x" % [@token]
+          s += " Token=0x" + @token.unpack("H*")[0]
         end
 
         s += " ac=#{@accept}" if @accept

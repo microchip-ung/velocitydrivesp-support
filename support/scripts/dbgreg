@@ -25,14 +25,19 @@ LM_DBG_REG_FIELDS_PORT = 4
 USAGE = <<-USAGE
 dbgreg - Register access debug tool
 
-
 Usage:
   dbgreg [options] miim|sw [c22|c45] (<PORT>[:<MMD>]:<ADDR>[=VAL])...
 
 Options:
   -h --help                  Show this screen.
-  -d --device <URL>          IP based terminal device to connect to.
-                             Ex: termhub://10.0.0.2:4000
+  -d --device <URL>          Device to connect to: a termhub:// URL
+                             (e.g. termhub://10.0.0.2:4000) or a local
+                             serial device (e.g. /dev/ttyACM0).
+  -b --baud <RATE>           Baud rate for a serial device (default
+                             115200). Ignored for a termhub:// URL.
+     --mup1-checksum <TYPE>  MUP1 checksum: internet (default) or
+                             crc32. Must match the firmware's
+                             configuration.
 
 Command details:
   Do a MIIM or Switch read or write request.
@@ -56,6 +61,14 @@ OptionParser.new do |opts|
 
     opts.on("-d", "--device <URL>", "The device terminal URL") do |d|
       $dev = d
+    end
+
+    opts.on("-b", "--baud <RATE>", "Serial baud rate") do |b|
+      $baud = b
+    end
+
+    opts.on("--mup1-checksum <TYPE>", "MUP1 checksum type") do |c|
+      $checksum = c
     end
 end.parse!
 
@@ -143,6 +156,8 @@ if $cmd == "miim"
 
   dev_opts = ""
   dev_opts = "-d #{$dev}" if $dev
+  dev_opts += " --baudrate #{$baud}" if $baud
+  dev_opts += " --checksum-type #{$checksum}" if $checksum
 
   cmd = "mup1ct #{dev_opts} coap post /dbg/reg --content-type 60 --accept 60"
   puts cmd
@@ -173,16 +188,12 @@ if $cmd == "miim"
             str += ("0x%04X  " % (r & 0xffff))
         end
         v = a[3]
-        if v.nil?
-            str += "ERROR"
-        else
-            16.times do |i|
-                str += "." if ((i > 0) && (i % 8) == 0)
-                str += (((1 << (15 - i)) & v) > 0 ? "1" : "0")
-            end
-            str += ("  0x%04X" % v)
-            str += "  #{v}"
+        16.times do |i|
+            str += "." if ((i > 0) && (i % 8) == 0)
+            str += (((1 << (15 - i)) & v) > 0 ? "1" : "0")
         end
+        str += ("  0x%04X" % v)
+        str += "  #{v}"
         if (idx == 0)
             puts ""
             hdr.length.times do
@@ -241,6 +252,8 @@ else
 
   dev_opts = ""
   dev_opts = "-d #{$dev}" if $dev
+  dev_opts += " --baudrate #{$baud}" if $baud
+  dev_opts += " --checksum-type #{$checksum}" if $checksum
 
   cmd = "mup1ct #{dev_opts} coap post /dbg/reg --content-type 60 --accept 60"
   puts cmd
@@ -261,16 +274,12 @@ else
         str += "    "
         str += ("0x%08X  " % a[1])
         v = a[2]
-        if v.nil?
-            str += "ERROR"
-        else
-            32.times do |i|
-                str += "." if ((i > 0) && (i % 8) == 0)
-                str += (((1 << (31 - i)) & v) > 0 ? "1" : "0")
-            end
-            str += ("  0x%08X" % v)
-            str += "  #{v}"
+        32.times do |i|
+            str += "." if ((i > 0) && (i % 8) == 0)
+            str += (((1 << (31 - i)) & v) > 0 ? "1" : "0")
         end
+        str += ("  0x%08X" % v)
+        str += "  #{v}"
         puts str
     end
   rescue
